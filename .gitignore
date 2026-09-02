@@ -1,0 +1,7 @@
+node_modules/
+target/
+*.log
+.env
+verifier/receipts/
+verifier/verifier-key.json
+verifier/verifier-solana-devnet.json

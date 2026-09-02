@@ -1,0 +1,20 @@
+{
+  "name": "quarters-verify",
+  "version": "1.0.0",
+  "private": true,
+  "description": "QUARTERS (quarters.fun): on-chain program, verifier, deterministic engines, and a receipt replayer. Published for verification.",
+  "license": "SEE LICENSE IN LICENSE",
+  "scripts": {
+    "test": "node verifier/test-determinism.js && node verifier/test-service.js",
+    "replay": "node tools/replay.js",
+    "verifier": "node verifier/service.js"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.32.1"
+  },
+  "overrides": {
+    "rpc-websockets": {
+      "uuid": "^9.0.1"
+    }
+  }
+}

@@ -1,0 +1,14 @@
+QUARTERS — Source-Available License (verification)
+
+Copyright (c) 2026 BASED LTD. All rights reserved.
+
+This source is published so that anyone can audit the on-chain program,
+re-execute score receipts, and verify where every quarter goes.
+
+You may read, build, run, and modify this code for the purpose of
+verification, review, security research, and personal, non-commercial use.
+You may not operate a competing pay-to-play service with it, or sell,
+sublicense, or redistribute it for commercial purposes, without written
+permission from BASED LTD (hello@quarters.fun).
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.

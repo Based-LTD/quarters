@@ -1,0 +1,1484 @@
+{
+  "address": "GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a",
+  "metadata": {
+    "name": "quarters",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "QUARTERS arcade cashier: coins in, verified scores, pots out"
+  },
+  "instructions": [
+    {
+      "name": "claim_bounty",
+      "discriminator": [
+        225,
+        157,
+        163,
+        238,
+        239,
+        169,
+        75,
+        226
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "verifier",
+          "signer": true
+        },
+        {
+          "name": "credit",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  114,
+                  101,
+                  100,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "credit.player",
+                "account": "Credit"
+              },
+              {
+                "kind": "account",
+                "path": "credit.index",
+                "account": "Credit"
+              }
+            ]
+          }
+        },
+        {
+          "name": "bounty",
+          "writable": true
+        },
+        {
+          "name": "player",
+          "writable": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "score",
+          "type": "u32"
+        },
+        {
+          "name": "replay_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "close_tab",
+      "discriminator": [
+        50,
+        190,
+        117,
+        26,
+        0,
+        101,
+        166,
+        239
+      ],
+      "accounts": [
+        {
+          "name": "tab",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  98
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "player"
+              }
+            ]
+          }
+        },
+        {
+          "name": "player",
+          "writable": true,
+          "signer": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "create_cabinet",
+      "discriminator": [
+        41,
+        86,
+        121,
+        118,
+        81,
+        140,
+        56,
+        37
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "cabinet",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "arcade"
+          ]
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "id",
+          "type": "u8"
+        },
+        {
+          "name": "game",
+          "type": {
+            "array": [
+              "u8",
+              16
+            ]
+          }
+        },
+        {
+          "name": "is_bounty",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "initialize",
+      "discriminator": [
+        175,
+        175,
+        109,
+        31,
+        13,
+        152,
+        155,
+        237
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "verifier",
+          "type": "pubkey"
+        },
+        {
+          "name": "treasury",
+          "type": "pubkey"
+        },
+        {
+          "name": "quarter_lamports",
+          "type": "u64"
+        },
+        {
+          "name": "pot_bps",
+          "type": "u16"
+        },
+        {
+          "name": "operator_bps",
+          "type": "u16"
+        },
+        {
+          "name": "period_seconds",
+          "type": "u32"
+        }
+      ]
+    },
+    {
+      "name": "insert_coin",
+      "discriminator": [
+        133,
+        224,
+        22,
+        114,
+        194,
+        69,
+        161,
+        189
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "cabinet"
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "bounty",
+          "writable": true
+        },
+        {
+          "name": "credit",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  114,
+                  101,
+                  100,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "player"
+              },
+              {
+                "kind": "account",
+                "path": "arcade.credit_counter",
+                "account": "Arcade"
+              }
+            ]
+          }
+        },
+        {
+          "name": "player",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "operator",
+          "writable": true
+        },
+        {
+          "name": "treasury",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "stakes",
+          "optional": true
+        }
+      ],
+      "args": [
+        {
+          "name": "seed_commit",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "open_tab",
+      "discriminator": [
+        76,
+        59,
+        11,
+        59,
+        218,
+        58,
+        30,
+        59
+      ],
+      "accounts": [
+        {
+          "name": "tab",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  98
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "player"
+              }
+            ]
+          }
+        },
+        {
+          "name": "player",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "session_key",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "deposit",
+          "type": "u64"
+        },
+        {
+          "name": "fee_float",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "set_operator",
+      "discriminator": [
+        238,
+        153,
+        101,
+        169,
+        243,
+        131,
+        36,
+        1
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "cabinet",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "arcade"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "new_operator",
+          "type": "pubkey"
+        }
+      ]
+    },
+    {
+      "name": "set_stakes",
+      "discriminator": [
+        48,
+        230,
+        170,
+        251,
+        80,
+        56,
+        57,
+        235
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "stakes",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "arcade"
+          ]
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "cabinet_id",
+          "type": "u8"
+        },
+        {
+          "name": "price",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "settle_pot",
+      "discriminator": [
+        120,
+        181,
+        232,
+        100,
+        60,
+        57,
+        32,
+        238
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "treasury",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "start_run",
+      "discriminator": [
+        72,
+        212,
+        1,
+        91,
+        61,
+        186,
+        2,
+        52
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "cabinet"
+        },
+        {
+          "name": "tab",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  116,
+                  97,
+                  98
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "tab.player",
+                "account": "Tab"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "bounty",
+          "writable": true
+        },
+        {
+          "name": "credit",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  114,
+                  101,
+                  100,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "tab.player",
+                "account": "Tab"
+              },
+              {
+                "kind": "account",
+                "path": "arcade.credit_counter",
+                "account": "Arcade"
+              }
+            ]
+          }
+        },
+        {
+          "name": "signer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "operator",
+          "writable": true
+        },
+        {
+          "name": "treasury",
+          "writable": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        },
+        {
+          "name": "stakes",
+          "optional": true
+        }
+      ],
+      "args": [
+        {
+          "name": "seed_commit",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "submit_score",
+      "discriminator": [
+        212,
+        128,
+        45,
+        22,
+        112,
+        82,
+        85,
+        235
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "verifier",
+          "signer": true
+        },
+        {
+          "name": "credit",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  114,
+                  101,
+                  100,
+                  105,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "credit.player",
+                "account": "Credit"
+              },
+              {
+                "kind": "account",
+                "path": "credit.index",
+                "account": "Credit"
+              }
+            ]
+          }
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "score",
+          "type": "u32"
+        },
+        {
+          "name": "replay_hash",
+          "type": {
+            "array": [
+              "u8",
+              32
+            ]
+          }
+        }
+      ]
+    },
+    {
+      "name": "update_config",
+      "discriminator": [
+        29,
+        158,
+        252,
+        191,
+        10,
+        83,
+        219,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "arcade"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "verifier",
+          "type": "pubkey"
+        },
+        {
+          "name": "treasury",
+          "type": "pubkey"
+        },
+        {
+          "name": "quarter_lamports",
+          "type": "u64"
+        },
+        {
+          "name": "pot_bps",
+          "type": "u16"
+        },
+        {
+          "name": "operator_bps",
+          "type": "u16"
+        },
+        {
+          "name": "period_seconds",
+          "type": "u32"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Arcade",
+      "discriminator": [
+        155,
+        172,
+        14,
+        87,
+        173,
+        242,
+        120,
+        99
+      ]
+    },
+    {
+      "name": "Bounty",
+      "discriminator": [
+        237,
+        16,
+        105,
+        198,
+        19,
+        69,
+        242,
+        234
+      ]
+    },
+    {
+      "name": "Cabinet",
+      "discriminator": [
+        150,
+        115,
+        59,
+        84,
+        188,
+        74,
+        224,
+        248
+      ]
+    },
+    {
+      "name": "Credit",
+      "discriminator": [
+        6,
+        79,
+        161,
+        136,
+        156,
+        172,
+        190,
+        149
+      ]
+    },
+    {
+      "name": "DailyPot",
+      "discriminator": [
+        249,
+        161,
+        93,
+        191,
+        159,
+        56,
+        101,
+        22
+      ]
+    },
+    {
+      "name": "Stakes",
+      "discriminator": [
+        63,
+        219,
+        229,
+        59,
+        58,
+        177,
+        202,
+        15
+      ]
+    },
+    {
+      "name": "Tab",
+      "discriminator": [
+        194,
+        242,
+        40,
+        53,
+        214,
+        169,
+        9,
+        172
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "BountyClaimed",
+      "discriminator": [
+        140,
+        202,
+        21,
+        51,
+        211,
+        65,
+        142,
+        21
+      ]
+    },
+    {
+      "name": "CoinInserted",
+      "discriminator": [
+        244,
+        133,
+        92,
+        17,
+        23,
+        242,
+        120,
+        156
+      ]
+    },
+    {
+      "name": "PotSettledEvent",
+      "discriminator": [
+        171,
+        190,
+        201,
+        231,
+        232,
+        232,
+        134,
+        251
+      ]
+    },
+    {
+      "name": "ScoreSubmitted",
+      "discriminator": [
+        15,
+        74,
+        143,
+        188,
+        62,
+        88,
+        81,
+        104
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "BadSplits",
+      "msg": "split basis points exceed 100%"
+    },
+    {
+      "code": 6001,
+      "name": "WrongOperator",
+      "msg": "operator account does not match cabinet operator"
+    },
+    {
+      "code": 6002,
+      "name": "WrongTreasury",
+      "msg": "treasury account does not match arcade treasury"
+    },
+    {
+      "code": 6003,
+      "name": "NotVerifier",
+      "msg": "signer is not the arcade verifier"
+    },
+    {
+      "code": 6004,
+      "name": "CreditConsumed",
+      "msg": "credit already consumed"
+    },
+    {
+      "code": 6005,
+      "name": "PotSettled",
+      "msg": "pot already settled"
+    },
+    {
+      "code": 6006,
+      "name": "WrongDay",
+      "msg": "pot day mismatch"
+    },
+    {
+      "code": 6007,
+      "name": "WrongCabinet",
+      "msg": "cabinet mismatch"
+    },
+    {
+      "code": 6008,
+      "name": "RecordStands",
+      "msg": "score does not beat the standing record"
+    },
+    {
+      "code": 6009,
+      "name": "WrongPlayer",
+      "msg": "player account does not match credit"
+    },
+    {
+      "code": 6010,
+      "name": "DayNotOver",
+      "msg": "day not over yet"
+    },
+    {
+      "code": 6011,
+      "name": "WrongWinnerAccounts",
+      "msg": "winner accounts do not match leaderboard"
+    },
+    {
+      "code": 6012,
+      "name": "NotSession",
+      "msg": "signer is neither the tab's session key nor its owner"
+    },
+    {
+      "code": 6013,
+      "name": "TabEmpty",
+      "msg": "tab balance cannot cover a quarter"
+    }
+  ],
+  "types": [
+    {
+      "name": "Arcade",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "authority",
+            "type": "pubkey"
+          },
+          {
+            "name": "verifier",
+            "type": "pubkey"
+          },
+          {
+            "name": "treasury",
+            "type": "pubkey"
+          },
+          {
+            "name": "quarter_lamports",
+            "type": "u64"
+          },
+          {
+            "name": "pot_bps",
+            "type": "u16"
+          },
+          {
+            "name": "operator_bps",
+            "type": "u16"
+          },
+          {
+            "name": "period_seconds",
+            "type": "u32"
+          },
+          {
+            "name": "credit_counter",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Bounty",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "record",
+            "type": "u32"
+          },
+          {
+            "name": "champion",
+            "type": "pubkey"
+          },
+          {
+            "name": "record_replay",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "BountyClaimed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "score",
+            "type": "u32"
+          },
+          {
+            "name": "paid",
+            "type": "u64"
+          },
+          {
+            "name": "replay_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "Cabinet",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "id",
+            "type": "u8"
+          },
+          {
+            "name": "game",
+            "type": {
+              "array": [
+                "u8",
+                16
+              ]
+            }
+          },
+          {
+            "name": "operator",
+            "type": "pubkey"
+          },
+          {
+            "name": "is_bounty",
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "CoinInserted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "credit_index",
+            "type": "u64"
+          },
+          {
+            "name": "seed_commit",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "day",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Credit",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "day",
+            "type": "u32"
+          },
+          {
+            "name": "seed_commit",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "consumed",
+            "type": "bool"
+          },
+          {
+            "name": "index",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          },
+          {
+            "name": "rent_payer",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DailyPot",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "initialized",
+            "type": "bool"
+          },
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "day",
+            "type": "u32"
+          },
+          {
+            "name": "settled",
+            "type": "bool"
+          },
+          {
+            "name": "count",
+            "type": "u8"
+          },
+          {
+            "name": "entries",
+            "type": {
+              "array": [
+                {
+                  "defined": {
+                    "name": "PotEntry"
+                  }
+                },
+                10
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PotEntry",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "score",
+            "type": "u32"
+          },
+          {
+            "name": "replay_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          }
+        ]
+      }
+    },
+    {
+      "name": "PotSettledEvent",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "day",
+            "type": "u32"
+          },
+          {
+            "name": "pool",
+            "type": "u64"
+          },
+          {
+            "name": "winners",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ScoreSubmitted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "credit_index",
+            "type": "u64"
+          },
+          {
+            "name": "score",
+            "type": "u32"
+          },
+          {
+            "name": "replay_hash",
+            "type": {
+              "array": [
+                "u8",
+                32
+              ]
+            }
+          },
+          {
+            "name": "day",
+            "type": "u32"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Stakes",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cabinet_id",
+            "type": "u8"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Tab",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "player",
+            "type": "pubkey"
+          },
+          {
+            "name": "session_key",
+            "type": "pubkey"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    }
+  ]
+}
