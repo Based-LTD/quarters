@@ -144,7 +144,9 @@ async function settleSweep() {
           settle.settled++; pending--;
           console.log(`settle: cabinet ${cab} day ${day} paid ${winners.length} winner(s) ${sig.slice(0, 12)}…`);
         } catch (e) {
-          settle.errors++; settle.lastError = `cab ${cab} day ${day}: ${String(e).slice(0, 140)}`;
+          const msg = String(e);
+          if (/DayNotOver/.test(msg)) continue;   // inside the settle grace; try next sweep
+          settle.errors++; settle.lastError = `cab ${cab} day ${day}: ${msg.slice(0, 140)}`;
           console.log("settle: FAILED " + settle.lastError);
         }
       }

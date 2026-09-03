@@ -99,7 +99,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         .rpc();
     } catch (e) { /* exists from a prior run */ }
   }
-  // Point both cabinets' operator at this run's treasury (the deed hook).
+  // Point both cabinets' operator at this run's treasury (the deed hook); restored at exit.
+  const _origOperators = {};
+  for (const id of [1, 2]) _origOperators[id] = (await program.account.cabinet.fetch(cabinetPda(id))).operator;
+  globalThis._restoreOperators = async () => { for (const id of [1, 2]) { try { await program.methods.setOperator(_origOperators[id]).accounts({ arcade: arcadePda, cabinet: cabinetPda(id), authority: payerKp.publicKey }).rpc({ commitment: "finalized" }); } catch (e) { console.log("  (operator restore failed for cab " + id + ")"); } } console.log("  (cabinet operators restored)"); };
   for (const id of [1, 2]) {
     await program.methods
       .setOperator(treasury.publicKey)
@@ -304,10 +307,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
   console.log(failures === 0 ? "\nALL GATES PASSED (devnet, live)" : `\n${failures} GATE CHECK(S) FAILED`);
   await _guard.restore();
+  if (globalThis._restoreOperators) await globalThis._restoreOperators();
   { let back = 0; for (const k of [...players, treasury]) back += await sweepBack(conn, k, payerKp.publicKey); console.log(`  (swept ${(back / 1e9).toFixed(4)} SOL back to the payer)`); }
   process.exit(failures === 0 ? 0 : 1);
 })().catch(async (e) => {
   console.error("FATAL:", e);
   try { if (globalThis._gatesGuard) await globalThis._gatesGuard.restore(); } catch (_) {}
+  try { if (globalThis._restoreOperators) await globalThis._restoreOperators(); } catch (_) {}
   process.exit(1);
 });
