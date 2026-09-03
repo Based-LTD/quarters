@@ -11,6 +11,7 @@ const http = require("http");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
+const guardArcadeConfig = require("./config-guard.js");
 const { makeCashier } = require("../web/cashier-core.js");
 const VoidRocks = require("../engine/voidrocks.js");
 
@@ -58,6 +59,9 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       wallet: new anchor.Wallet(payerKp),
       sha256: async (buf) => crypto.createHash("sha256").update(buf).digest(),
     });
+    const _vk = anchor.web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path.join(__dirname, "../verifier/verifier-solana-devnet.json")))));
+    const _arc = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], cashier.program.programId)[0];
+    const _guard = await guardArcadeConfig(cashier.program, _arc, payerKp.publicKey, { verifier: _vk.publicKey, fundFrom: payerKp });
 
     // Don't straddle a pot boundary mid-test.
     try { const _ap = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], new anchor.web3.PublicKey("GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a"))[0]; const _ai = await new anchor.web3.Connection("https://api.devnet.solana.com").getAccountInfo(_ap); if (_ai) PERIOD = _ai.data.readUInt32LE(8 + 32 + 32 + 32 + 8 + 2 + 2); } catch (e) {}
@@ -151,6 +155,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   } catch (e) {
     check("gate ran to completion", false, String(e).slice(0, 300));
   } finally {
+    if (typeof _guard !== "undefined") await _guard.restore();
     svc.kill();
   }
   console.log(failures === 0 ? "\nCASHIER GATE PASSED" : `\n${failures} CHECK(S) FAILED`);

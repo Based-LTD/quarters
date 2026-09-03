@@ -725,10 +725,13 @@ pub struct ClaimBounty<'info> {
 pub struct SettlePot<'info> {
     #[account(seeds = [b"arcade"], bump = arcade.bump)]
     pub arcade: Account<'info, Arcade>,
+    // Closed after paying out: the pot's rent goes back to the treasury, so
+    // pre-opening pots (open_pot) costs the house nothing over time.
     #[account(
         mut,
         seeds = [b"pot".as_ref(), &[pot.cabinet_id], &pot.day.to_le_bytes()],
-        bump
+        bump,
+        close = treasury
     )]
     pub pot: Account<'info, DailyPot>,
     /// CHECK: validated against arcade.treasury in the handler

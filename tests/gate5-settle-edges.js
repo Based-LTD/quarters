@@ -8,6 +8,8 @@
 //   D. Double-settle rejected.
 // Uses cabinets 3 (breakpoint) and 4 (swarm) to keep pots isolated.
 const anchor = require("@coral-xyz/anchor");
+const guardArcadeConfig = require("./config-guard.js");
+const sweepBack = require("./sweep.js");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const fs = require("fs");
@@ -33,7 +35,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 function swarmMasks(seed) {
   const s = Swarm.createState(seed);
   const masks = [];
-  while (!s.gameOver && s.tick < 12000) {
+  while (!s.gameOver && s.tick < 36000) {   // play to the end: the verifier requires gameOver
     let m = 8, target = -1;
     for (let i = 0; i < s.alive.length; i++) {
       if (s.alive[i]) { target = Swarm.alienPos(s, i).x; break; }
@@ -61,6 +63,7 @@ function swarmMasks(seed) {
   svc.stderr.on("data", (d) => process.stdout.write("  [svc!] " + d));
   await sleep(1500);
 
+  let _guard = null;
   try {
     const payerKp = anchor.web3.Keypair.fromSecretKey(
       Uint8Array.from(JSON.parse(fs.readFileSync(path.join(os.homedir(), ".config/solana/id.json")))));
@@ -73,10 +76,11 @@ function swarmMasks(seed) {
     const PID = program.programId;
     const pda = (seeds) => anchor.web3.PublicKey.findProgramAddressSync(seeds, PID)[0];
     const arcadePda = pda([Buffer.from("arcade")]);
-    // The settle test needs a short period; force 120s and restore after.
-    const _a0 = await program.account.arcade.fetch(arcadePda); const _origPeriod = _a0.periodSeconds;
-    if (_origPeriod !== PERIOD) { console.log("  (setting a " + PERIOD + "s period for the settle test; restoring after)"); await program.methods.updateConfig(_a0.verifier, _a0.treasury, _a0.quarterLamports, _a0.potBps, _a0.operatorBps, PERIOD).accounts({ arcade: arcadePda, authority: payerKp.publicKey }).rpc(); }
-    globalThis._restorePeriod = async () => { try { const _a1 = await program.account.arcade.fetch(arcadePda); if (_a1.periodSeconds !== _origPeriod) { await program.methods.updateConfig(_a1.verifier, _a1.treasury, _a1.quarterLamports, _a1.potBps, _a1.operatorBps, _origPeriod).accounts({ arcade: arcadePda, authority: payerKp.publicKey }).rpc(); console.log("  (period restored to " + _origPeriod + "s)"); } } catch (e) { console.log("  (period restore failed: " + String(e).slice(0, 80) + ")"); } };
+    const _vk5 = anchor.web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path.join(__dirname, "../verifier/verifier-solana-devnet.json")))));
+    // Throwaway treasury seeded above the rent floor so payouts/fees don't net against the payer.
+    const _tk = anchor.web3.Keypair.generate();
+    await anchor.web3.sendAndConfirmTransaction(conn, new anchor.web3.Transaction().add(anchor.web3.SystemProgram.transfer({ fromPubkey: payerKp.publicKey, toPubkey: _tk.publicKey, lamports: 3_000_000 })), [payerKp]);
+    _guard = await guardArcadeConfig(program, arcadePda, payerKp.publicKey, { verifier: _vk5.publicKey, treasury: _tk.publicKey, period: PERIOD, fundFrom: payerKp });
     const arcade = await program.account.arcade.fetch(arcadePda);
     const potPda = (cab, day) => {
       const d = Buffer.alloc(4);
@@ -98,7 +102,7 @@ function swarmMasks(seed) {
     const pot3 = potPda(3, day), pot4 = potPda(4, day);
 
     // --- A setup: one coin on cabinet 3, never verified ---
-    await cashier.insertCoin(3) ^ 0xa) | 0);
+    await cashier.insertCoin(3);
     console.log("  (cab 3: 1 coin, no submit — the ghost pot)");
 
     // --- B setup: four verified scores on cabinet 4, same wallet ---
@@ -122,8 +126,8 @@ function swarmMasks(seed) {
       `count=${pot4Acct.count}`);
 
     // --- roll the period over ---
-    console.log(`  (waiting ${untilBoundary() + 3}s for the period to end)`);
-    await sleep((untilBoundary() + 3) * 1000);
+    console.log(`  (waiting ${untilBoundary() + 3 + Math.min(900, Math.floor(PERIOD / 4))}s for the period to end + settle grace)`);
+    await sleep((untilBoundary() + 3 + Math.min(900, Math.floor(PERIOD / 4))) * 1000);
 
     const rent3 = (await conn.getAccountInfo(pot3)).lamports && await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot3)).data.length);
     const pool3 = (await conn.getBalance(pot3)) - rent3;
@@ -137,9 +141,9 @@ function swarmMasks(seed) {
     await sleep(1500);
     const treasuryAfterA = await conn.getBalance(arcade.treasury);
     const pot3After = await conn.getBalance(pot3);
-    check("A: 0-winner pool sweeps to treasury exactly", treasuryAfterA - treasuryBefore === pool3,
+    check("A: 0-winner pool + pot rent sweep to treasury exactly", treasuryAfterA - treasuryBefore === pool3 + rent3,
       `pool=${pool3} treasury+=${treasuryAfterA - treasuryBefore}`);
-    check("A: pot left at rent", pot3After === rent3, `pot=${pot3After} rent=${rent3}`);
+    check("A: pot closed after settle (rent back to treasury)", pot3After === 0, `pot=${pot3After}`);
 
     // --- D: double-settle rejected ---
     let doubleRejected = false;
@@ -187,13 +191,13 @@ function swarmMasks(seed) {
     check("B: podium + tail paid exactly (4th place gets 400/7 bps)",
       payerAfter - payerBefore === expectPayer - fee,
       `got ${payerAfter - payerBefore + fee}, want ${expectPayer} of pool ${pool4}`);
-    check("B: rounding leftover to treasury exactly", treasuryAfterB - treasuryBeforeB === expectTreasury,
+    check("B: rounding leftover + pot rent to treasury exactly", treasuryAfterB - treasuryBeforeB === expectTreasury + rent4,
       `got ${treasuryAfterB - treasuryBeforeB}, want ${expectTreasury}`);
     console.log(`  (settle tx ${sig.slice(0, 14)}…)`);
   } catch (e) {
     check("gate ran to completion", false, String(e).slice(0, 300));
   } finally {
-    if (globalThis._restorePeriod) await globalThis._restorePeriod(); svc.kill();
+    if (_guard) await _guard.restore(); if (typeof _tk !== "undefined") { const back = await sweepBack(conn, _tk, payerKp.publicKey); console.log(`  (swept ${(back / 1e9).toFixed(4)} SOL back)`); } svc.kill();
   }
   console.log(failures === 0 ? "\nGATE 5 PASSED" : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);

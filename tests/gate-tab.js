@@ -4,6 +4,8 @@
 // the tab exactly; rent refunds cycle back to the session key; unauthorized
 // keys and empty tabs are rejected; close_tab refunds every unused lamport.
 const anchor = require("@coral-xyz/anchor");
+const guardArcadeConfig = require("./config-guard.js");
+const sweepBack = require("./sweep.js");
 const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
@@ -39,6 +41,18 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const stranger = Keypair.generate();    // not authorized on the tab
 
   const [arcadePda] = PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID);
+  // A throwaway treasury seeded above the rent floor (a sub-rent house cut into an empty account fails).
+  let _treasuryKp = null;
+  async function fundedThrowaway() {
+    const k = Keypair.generate(); _treasuryKp = k;
+    const tx = new anchor.web3.Transaction().add(SystemProgram.transfer({ fromPubkey: payerKp.publicKey, toPubkey: k.publicKey, lamports: 3_000_000 }));
+    await anchor.web3.sendAndConfirmTransaction(conn, tx, [payerKp]);
+    return k.publicKey;
+  }
+
+  globalThis._tabGuard = null;
+  const _guard = await guardArcadeConfig(program, arcadePda, payerKp.publicKey, { verifier: verifier.publicKey, treasury: await fundedThrowaway(), fundFrom: payerKp });   // treasury must not be the payer for the split math; pre-funded above rent
+  globalThis._tabGuard = _guard;
   const cabinetPda = PublicKey.findProgramAddressSync([Buffer.from("cabinet"), Buffer.from([1])], PID)[0];
   const bountyPda = PublicKey.findProgramAddressSync([Buffer.from("bounty"), Buffer.from([1])], PID)[0];
   const tabPda = PublicKey.findProgramAddressSync([Buffer.from("tab"), payerKp.publicKey.toBuffer()], PID)[0];
@@ -119,7 +133,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("session key played 3 credits with no wallet signature", true);
   check("tab debited exactly 3 quarters", tabBal0 - tabBal1 === 3 * QUARTER, `debit=${tabBal0 - tabBal1}`);
   check("pot received 3 x 70% from tab", potAfter - potBefore >= 3 * QUARTER * 0.7, `+${potAfter - potBefore}`);
-  check("operator+treasury received 3 x 30% from tab", treAfter - treBefore === 3 * QUARTER * 0.3, `+${treAfter - treBefore}`);
+  check("treasury received 3 x 15% from tab (operator gets the other 15%)", treAfter - treBefore === 3 * QUARTER * 0.15, `+${treAfter - treBefore}`);
 
   // --- rent refunds cycle back to the session key on submit ---
   const sessBefore = await conn.getBalance(session.publicKey);
@@ -138,7 +152,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       .rpc();
   }
   const sessAfter = await conn.getBalance(session.publicKey);
-  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 111);
+  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 119); // Credit::INIT_SPACE = 119 (v3)
   check("credit rent refunded to the session key", sessAfter - sessBefore === creditRent,
     `refund=${sessAfter - sessBefore} rent=${creditRent}`);
   const potAcc = await program.account.dailyPot.fetch(pot);
@@ -174,8 +188,11 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   check("tab account closed", gone);
 
   console.log(failures === 0 ? "\nTAB GATES PASSED (devnet, live)" : `\n${failures} CHECK(S) FAILED`);
+  await _guard.restore();
+  { let back = 0; for (const k of [session, stranger, _treasuryKp].filter(Boolean)) back += await sweepBack(conn, k, payerKp.publicKey); console.log(`  (swept ${(back / 1e9).toFixed(4)} SOL back to the payer)`); }
   process.exit(failures === 0 ? 0 : 1);
-})().catch((e) => {
+})().catch(async (e) => {
   console.error("FATAL:", e);
+  try { if (globalThis._tabGuard) await globalThis._tabGuard.restore(); } catch (_) {}
   process.exit(1);
 });

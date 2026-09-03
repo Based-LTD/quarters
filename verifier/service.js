@@ -53,6 +53,9 @@ const ENGINE_HASH = Object.fromEntries(Object.keys(GAMES).map((g) => [g,
 process.on("uncaughtException", (e) => { console.log("UNCAUGHT " + String(e && e.stack || e).slice(0, 300)); });
 const STARTED_AT = Date.now();
 const readCache = { lb: null };
+const keyBal = { lamports: null, at: 0 };
+setInterval(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); } catch (e) {} }, 60_000).unref();
+setTimeout(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); } catch (e) {} }, 3000);
 const submitHits = new Map();   // ip → [timestamps]
 setInterval(() => { const now = Date.now(); for (const [k, v] of submitHits) { const keep = v.filter((t) => now - t < 60_000); if (keep.length) submitHits.set(k, keep); else submitHits.delete(k); } }, 60_000).unref();
 const inFlight = new Set();     // creditIds being verified right now
@@ -148,7 +151,7 @@ async function settleSweep() {
     }
     settle.pending = pending;
     // House pays the pot rent: pre-open this and next period's pots.
-    if (program.methods.openPot) {
+    if (program.methods.openPot && period >= 3600) {   // never for short test periods
       for (const day of [nowDay, nowDay + 1]) {
         for (let cab = 1; cab <= MAX_CAB; cab++) {
           const pk = potPda(cab, day);
@@ -433,7 +436,8 @@ const server = http.createServer((req, res) => {
     return send(200, {
       ok: true,
       uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
-      settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, pending: settle.pending, errors: settle.errors, lastError: settle.lastError } : "off",
+      settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, opened: settle.opened || 0, pending: settle.pending, errors: settle.errors, lastError: settle.lastError } : "off",
+      signer: chain ? { pubkey: chain.kp.publicKey.toBase58(), lamports: keyBal.lamports, at: keyBal.at } : null,
       games: Object.keys(GAMES).length,
       engines: ENGINE_HASH,
       verifierPubkey: KEYS.publicKey.export({ format: "der", type: "spki" }).toString("base64"),

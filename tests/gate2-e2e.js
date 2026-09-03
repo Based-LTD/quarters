@@ -5,6 +5,7 @@
 // submits the score → the score appears in the on-chain pot, the credit
 // closes, and the rent comes back. Replay reuse dies at the closed credit.
 const anchor = require("@coral-xyz/anchor");
+const guardArcadeConfig = require("./config-guard.js");
 const { spawn } = require("child_process");
 const crypto = require("crypto");
 const http = require("http");
@@ -81,6 +82,7 @@ function post(pathName, body) {
   }
 
   const [arcadePda] = PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID);
+  const _guard = await guardArcadeConfig(program, arcadePda, payerKp.publicKey, { verifier: verifierKp.publicKey, fundFrom: payerKp });
   const cabinetPda = PublicKey.findProgramAddressSync([Buffer.from("cabinet"), Buffer.from([1])], PID)[0];
   const bountyPda = PublicKey.findProgramAddressSync([Buffer.from("bounty"), Buffer.from([1])], PID)[0];
 
@@ -215,6 +217,7 @@ function post(pathName, body) {
       cheat.code === 422 && String(cheat.body.reason).includes("commitment"), cheat.body.reason);
   }
 
+  await _guard.restore();
   svc.kill();
   console.log(failures === 0 ? "\nGATE 2 CLOSED — full loop live on devnet" : `\n${failures} CHECK(S) FAILED`);
   process.exit(failures === 0 ? 0 : 1);
