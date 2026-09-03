@@ -108,7 +108,8 @@ if (process.env.DEVNET_SUBMIT === "1") {
   };
   const arcadePda = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID)[0];
   const cabinetPda = (id) => anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("cabinet"), Buffer.from([id])], PID)[0];
-  chain = { anchor, program, kp, conn, potPda, arcadePda, cabinetPda, cabinetGame: new Map() };
+  const bountyPda = (id) => anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("bounty"), Buffer.from([id])], PID)[0];
+  chain = { anchor, program, kp, conn, potPda, arcadePda, cabinetPda, bountyPda, cabinetGame: new Map(), cabinetBounty: new Map() };
   console.log("devnet submit mode: verifier", kp.publicKey.toBase58(), "program", PID.toBase58());
 }
 
@@ -178,19 +179,28 @@ if (settle.enabled && chain) {
 async function chainSubmit(creditIdB58, body, result) {
   const { anchor, program, kp, potPda, arcadePda } = chain;
   const creditPk = new anchor.web3.PublicKey(creditIdB58);
-  let credit;
-  try { credit = await program.account.credit.fetch(creditPk); }
-  catch (e) { return { ok: false, code: 410, reason: "credit not found (unpaid, or already scored)" }; }
+  // The player's wallet may have confirmed the coin on a faster RPC than
+  // ours; give a fresh credit a few seconds to appear before calling it gone.
+  let credit = null;
+  for (let i = 0; i < 4 && !credit; i++) {
+    try { credit = await program.account.credit.fetch(creditPk); }
+    catch (e) { if (i < 3) await new Promise((r) => setTimeout(r, 1500)); }
+  }
+  if (!credit) return { ok: false, code: 410, reason: "credit not found (unpaid, or already scored)" };
 
   // The credit's cabinet decides the game. A replay from a higher-scoring
   // engine must not be able to land in another cabinet's pot.
   let cabGame = chain.cabinetGame.get(credit.cabinetId);
   if (!cabGame) {
-    try {
-      const cab = await program.account.cabinet.fetch(chain.cabinetPda(credit.cabinetId));
-      cabGame = Buffer.from(cab.game).toString("utf8").replace(/\0+$/, "");
-      chain.cabinetGame.set(credit.cabinetId, cabGame);
-    } catch (e) { return { ok: false, code: 502, reason: "cabinet lookup failed" }; }
+    let cab = null;
+    for (let i = 0; i < 3 && !cab; i++) {
+      try { cab = await program.account.cabinet.fetch(chain.cabinetPda(credit.cabinetId)); }
+      catch (e) { if (i < 2) await new Promise((r) => setTimeout(r, 1000)); }
+    }
+    if (!cab) return { ok: false, code: 502, reason: "cabinet lookup failed" };
+    cabGame = Buffer.from(cab.game).toString("utf8").replace(/\0+$/, "");
+    chain.cabinetGame.set(credit.cabinetId, cabGame);
+    chain.cabinetBounty.set(credit.cabinetId, !!cab.isBounty);
   }
   if (cabGame !== body.game) return { ok: false, code: 422, reason: `credit is for ${cabGame}, not ${body.game}` };
 
@@ -206,6 +216,24 @@ async function chainSubmit(creditIdB58, body, result) {
     .update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE }))
     .digest();
 
+  // Bounty cabinet: beat the standing record and claim_bounty pays the whole
+  // pool to the player; otherwise the attempt is recorded via submit_score
+  // (credit consumed, rent refunded) and the pool grows.
+  if (chain.cabinetBounty.get(credit.cabinetId)) {
+    const bountyPk = chain.bountyPda(credit.cabinetId);
+    const b = await program.account.bounty.fetch(bountyPk);
+    const poolBefore = await chain.conn.getBalance(bountyPk);
+    if (result.score > b.record) {
+      const sig = await program.methods
+        .claimBounty(result.score, Array.from(replayHash))
+        .accounts({ arcade: arcadePda, verifier: kp.publicKey, credit: creditPk, bounty: bountyPk, player: credit.player, rentPayer: credit.rentPayer })
+        .rpc();
+      return { ok: true, txSig: sig, replayHash: replayHash.toString("hex"), player: credit.player.toBase58(),
+        bounty: { claimed: true, previousRecord: b.record, newRecord: result.score, paidLamports: poolBefore } };
+    }
+    // not a record: fall through to submit_score so the credit closes and the run is on the books
+    var bountyNote = { claimed: false, record: b.record, poolLamports: poolBefore };
+  }
   const sig = await program.methods
     .submitScore(result.score, Array.from(replayHash))
     .accounts({
@@ -216,7 +244,7 @@ async function chainSubmit(creditIdB58, body, result) {
       rentPayer: credit.rentPayer,
     })
     .rpc();
-  return { ok: true, txSig: sig, replayHash: replayHash.toString("hex"), player: credit.player.toBase58() };
+  return { ok: true, txSig: sig, replayHash: replayHash.toString("hex"), player: credit.player.toBase58(), ...(typeof bountyNote !== "undefined" ? { bounty: bountyNote } : {}) };
 }
 
 // TAS heuristic v1: humans have messy inter-press timing. A long run whose
