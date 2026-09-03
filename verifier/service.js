@@ -54,8 +54,9 @@ process.on("uncaughtException", (e) => { console.log("UNCAUGHT " + String(e && e
 const STARTED_AT = Date.now();
 const readCache = { lb: null };
 const keyBal = { lamports: null, at: 0 };
-setInterval(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); } catch (e) {} }, 60_000).unref();
-setTimeout(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); } catch (e) {} }, 3000);
+const healthCache = { arcade: null };
+setInterval(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); const a = await chain.program.account.arcade.fetch(chain.arcadePda); healthCache.arcade = { verifier: a.verifier.toBase58(), treasury: a.treasury.toBase58(), period: a.periodSeconds }; } catch (e) {} }, 60_000).unref();
+setTimeout(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); const a = await chain.program.account.arcade.fetch(chain.arcadePda); healthCache.arcade = { verifier: a.verifier.toBase58(), treasury: a.treasury.toBase58(), period: a.periodSeconds }; } catch (e) {} }, 3000);
 const submitHits = new Map();   // ip → [timestamps]
 setInterval(() => { const now = Date.now(); for (const [k, v] of submitHits) { const keep = v.filter((t) => now - t < 60_000); if (keep.length) submitHits.set(k, keep); else submitHits.delete(k); } }, 60_000).unref();
 const inFlight = new Set();     // creditIds being verified right now
@@ -118,12 +119,13 @@ if (process.env.DEVNET_SUBMIT === "1") {
 // exists, is unsettled, and whose period is over gets settle_pot with the
 // stored entries as remaining accounts. Idempotent: settled pots are skipped,
 // and the program rejects double-settles anyway.
-const settle = { enabled: process.env.SETTLE === "1", lastRun: null, lastOk: null, settled: 0, errors: 0, lastError: null, pending: 0 };
+const settle = { enabled: process.env.SETTLE === "1", lastRun: null, lastOk: null, settled: 0, errors: 0, lastError: null, pending: 0, sweepErrors: 0, lastSweepErrors: 0, opened: 0, lastOpenError: null };
 async function settleSweep() {
   if (!chain) return;
   const { anchor, program, kp, conn, potPda, arcadePda } = chain;
   const MAX_CAB = 31, LOOKBACK = parseInt(process.env.SETTLE_LOOKBACK || "7", 10);
   settle.lastRun = Date.now();
+  settle.lastSweepErrors = settle.sweepErrors; settle.sweepErrors = 0;
   try {
     const arcade = await program.account.arcade.fetch(arcadePda);
     const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
@@ -147,7 +149,7 @@ async function settleSweep() {
         } catch (e) {
           const msg = String(e);
           if (/DayNotOver/.test(msg)) continue;   // inside the settle grace; try next sweep
-          settle.errors++; settle.lastError = `cab ${cab} day ${day}: ${msg.slice(0, 140)}`;
+          settle.errors++; settle.sweepErrors++; settle.lastError = `cab ${cab} day ${day}: ${msg.slice(0, 140)}`;
           console.log("settle: FAILED " + settle.lastError);
         }
       }
@@ -162,7 +164,7 @@ async function settleSweep() {
           try {
             await program.methods.openPot(day).accounts({ arcade: arcadePda, cabinet: chain.cabinetPda(cab), pot: pk, payer: kp.publicKey, systemProgram: anchor.web3.SystemProgram.programId }).rpc();
             settle.opened = (settle.opened || 0) + 1;
-          } catch (e) { settle.lastError = `open_pot cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
+          } catch (e) { settle.sweepErrors++; settle.lastOpenError = `open_pot cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
         }
       }
     }
@@ -222,7 +224,7 @@ async function chainSubmit(creditIdB58, body, result) {
   if (chain.cabinetBounty.get(credit.cabinetId)) {
     const bountyPk = chain.bountyPda(credit.cabinetId);
     const b = await program.account.bounty.fetch(bountyPk);
-    const poolBefore = await chain.conn.getBalance(bountyPk);
+    const poolBefore = (await chain.conn.getBalance(bountyPk)) - (await chain.conn.getMinimumBalanceForRentExemption(8 + 77));   // pool excludes rent
     if (result.score > b.record) {
       const sig = await program.methods
         .claimBounty(result.score, Array.from(replayHash))
@@ -396,15 +398,17 @@ const server = http.createServer((req, res) => {
       } catch (e) { /* no pot yet this period */ }
       let bounty = null;
       try {
-        const bPda = anchor.web3.PublicKey.findProgramAddressSync(
-          [Buffer.from("bounty"), Buffer.from([cabId])], program.programId)[0];
-        const b = await program.account.bounty.fetch(bPda);
-        bounty = {
-          record: b.record,
-          champion: b.champion.toBase58(),
-          lamports: await chain.conn.getBalance(bPda),
-        };
-      } catch (e) { /* cabinet has no bounty */ }
+        // only real bounty cabinets have a bounty; non-bounty cabinets may hold
+        // a phantom Bounty account (rent only) that must not be shown as a pool
+        let isB = chain.cabinetBounty.get(cabId);
+        if (isB === undefined) { const cab = await program.account.cabinet.fetch(chain.cabinetPda(cabId)); isB = !!cab.isBounty; chain.cabinetBounty.set(cabId, isB); }
+        if (isB) {
+          const bPda = chain.bountyPda(cabId);
+          const b = await program.account.bounty.fetch(bPda);
+          const rent = await chain.conn.getMinimumBalanceForRentExemption(8 + 77);
+          bounty = { record: b.record, champion: b.champion.toBase58(), lamports: Math.max(0, (await chain.conn.getBalance(bPda)) - rent) };
+        }
+      } catch (e) { /* no bounty */ }
       send(200, { cabinetId: cabId, day, periodSeconds: period, entries, potLamports, bounty });
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
@@ -463,10 +467,31 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "GET" && req.url === "/health") {
-    return send(200, {
-      ok: true,
+    // Sensors: each green/yellow/red; overall = worst; 503 on red so any dumb
+    // monitor can page on status code alone.
+    const sensors = {};
+    const POT_RENT = 5218392, CABS = 31;
+    if (chain) {
+      const ident = healthCache.arcade ? (healthCache.arcade.verifier === chain.kp.publicKey.toBase58() ? "green" : "red") : "yellow";
+      sensors.verifierIdentity = { status: ident, detail: healthCache.arcade ? `arcade.verifier ${healthCache.arcade.verifier.slice(0, 8)} vs signer ${chain.kp.publicKey.toBase58().slice(0, 8)}` : "not read yet" };
+      const periods = keyBal.lamports === null ? null : keyBal.lamports / (POT_RENT * CABS);
+      sensors.signerRunway = { status: periods === null ? "yellow" : periods < 1 ? "red" : periods < 2 ? "yellow" : "green", detail: periods === null ? "unknown" : `${periods.toFixed(2)} periods of pot rent (${(keyBal.lamports / 1e9).toFixed(3)} SOL)` };
+      if (settle.enabled) {
+        const up = Date.now() - STARTED_AT, age = settle.lastOk ? Date.now() - settle.lastOk : up;
+        const every = Math.max(60, parseInt(process.env.SETTLE_INTERVAL_S || "300", 10)) * 1000;
+        sensors.sweepFreshness = { status: up < 2 * every ? "green" : age < 2 * every ? "green" : age < 6 * every ? "yellow" : "red", detail: `last ok ${Math.round(age / 1000)}s ago` };
+        sensors.sweepErrors = { status: settle.lastSweepErrors > 0 ? "yellow" : "green", detail: settle.lastSweepErrors > 0 ? (settle.lastError || settle.lastOpenError || "") : "clean" };
+        sensors.stalePots = { status: settle.pending > 3 ? "red" : settle.pending > 0 ? "yellow" : "green", detail: `${settle.pending} unsettled past grace` };
+      }
+    }
+    const rank = { green: 0, yellow: 1, red: 2 };
+    const overall = Object.values(sensors).reduce((w, x) => (rank[x.status] > rank[w] ? x.status : w), "green");
+    return send(overall === "red" ? 503 : 200, {
+      ok: overall !== "red",
+      status: overall,
+      sensors,
       uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
-      settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, opened: settle.opened || 0, pending: settle.pending, errors: settle.errors, lastError: settle.lastError } : "off",
+      settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, opened: settle.opened || 0, pending: settle.pending, errors: settle.errors, lastSweepErrors: settle.lastSweepErrors, lastError: settle.lastError, lastOpenError: settle.lastOpenError } : "off",
       signer: chain ? { pubkey: chain.kp.publicKey.toBase58(), lamports: keyBal.lamports, at: keyBal.at } : null,
       games: Object.keys(GAMES).length,
       engines: ENGINE_HASH,
@@ -539,7 +564,11 @@ const server = http.createServer((req, res) => {
             if (!oc.ok) return send(oc.code, { verified: false, reason: oc.reason });
             finish(oc);
           })
-          .catch((e) => send(502, { verified: false, reason: "chain submit failed: " + String(e).slice(0, 200) }));
+          .catch((e) => {
+            const m = String(e);
+            const definitive = /SubmitWindow|PotSettled|CreditConsumed|WrongDay|RecordStands/.test(m);
+            send(definitive ? 422 : 502, { verified: false, reason: (definitive ? "run cannot be scored: " : "chain submit failed: ") + m.slice(0, 200) });
+          });
       } else {
         finish(null);
       }
