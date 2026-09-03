@@ -93,7 +93,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const resp = await cashier.submit(URL, {
       creditId: coin.creditId,
       game: "voidrocks",
-      seed, secret: coin.secret,
+      seed, secret: coin.secret, salt: coin.salt,
       inputsRLE: VoidRocks.encodeRLE(masks),
       claimedScore: s.score,
       claimedHash: VoidRocks.stateHash(s),
@@ -139,7 +139,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const resp2 = await cashier.submit(URL, {
       creditId: run.creditId,
       game: "coil",
-      seed: seed2, secret: run.secret,
+      seed: seed2, secret: run.secret, salt: run.salt,
       inputsRLE: Coil.encodeRLE(cmasks),
       claimedScore: cs.score,
       claimedHash: Coil.stateHash(cs),

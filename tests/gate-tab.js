@@ -107,7 +107,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       .startRun(Array.from(commit))
       .accounts({
         arcade: arcadePda,
-        cabinet: cabinetPda, stakes: stakesPdaOf(1),
+        cabinet: cabinetPda, stakes: stakesPdaOf(1), slotHashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY,
         tab: tabPda,
         pot: potPda(Math.floor(Date.now() / 1000 / PERIOD)),
         bounty: bountyPda,
@@ -152,7 +152,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       .rpc();
   }
   const sessAfter = await conn.getBalance(session.publicKey);
-  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 119); // Credit::INIT_SPACE = 119 (v3)
+  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 127); // Credit::INIT_SPACE = 119 (v3)
   check("credit rent refunded to the session key", sessAfter - sessBefore === creditRent,
     `refund=${sessAfter - sessBefore} rent=${creditRent}`);
   const potAcc = await program.account.dailyPot.fetch(pot);

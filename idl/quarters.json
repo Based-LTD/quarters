@@ -76,6 +76,30 @@
       ]
     },
     {
+      "name": "close_expired_credit",
+      "discriminator": [
+        250,
+        192,
+        21,
+        49,
+        28,
+        90,
+        17,
+        196
+      ],
+      "accounts": [
+        {
+          "name": "credit",
+          "writable": true
+        },
+        {
+          "name": "rent_payer",
+          "writable": true
+        }
+      ],
+      "args": []
+    },
+    {
       "name": "close_tab",
       "discriminator": [
         50,
@@ -342,6 +366,10 @@
         },
         {
           "name": "stakes"
+        },
+        {
+          "name": "slot_hashes",
+          "address": "SysvarS1otHashes111111111111111111111111111"
         }
       ],
       "args": [
@@ -616,6 +644,10 @@
         {
           "name": "treasury",
           "writable": true
+        },
+        {
+          "name": "pot_rent_payer",
+          "writable": true
         }
       ],
       "args": []
@@ -731,6 +763,10 @@
         },
         {
           "name": "stakes"
+        },
+        {
+          "name": "slot_hashes",
+          "address": "SysvarS1otHashes111111111111111111111111111"
         }
       ],
       "args": [
@@ -1319,6 +1355,15 @@
           {
             "name": "inserted_at",
             "type": "i64"
+          },
+          {
+            "name": "salt",
+            "type": {
+              "array": [
+                "u8",
+                8
+              ]
+            }
           }
         ]
       }
@@ -1360,6 +1405,10 @@
                 10
               ]
             }
+          },
+          {
+            "name": "rent_payer",
+            "type": "pubkey"
           }
         ]
       }

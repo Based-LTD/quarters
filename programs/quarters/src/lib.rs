@@ -7,7 +7,18 @@ use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
 
 pub const SUBMIT_WINDOW: i64 = 1200;   // seconds from insert_coin to submit_score
-pub const SETTLE_GRACE: i64 = 900;     // seconds after a period before settle_pot (capped at period/4)
+pub const SETTLE_GRACE: i64 = 1260;    // ≥ SUBMIT_WINDOW + margin: a run can never find its pot already settled (capped at period/4)
+
+// The most recent slot hash, unknowable before the coin lands: mixed into the
+// engine seed so nobody can shop for a lucky seed offline.
+fn recent_slot_salt(slot_hashes: &AccountInfo) -> Result<[u8; 8]> {
+    let data = slot_hashes.try_borrow_data()?;
+    // layout: u64 len, then entries of (u64 slot, [u8;32] hash), most recent first
+    require!(data.len() >= 8 + 8 + 32, QuartersError::WrongWinnerAccounts);
+    let mut salt = [0u8; 8];
+    salt.copy_from_slice(&data[16..24]);
+    Ok(salt)
+}
 
 declare_id!("GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a");
 
@@ -129,6 +140,7 @@ pub mod quarters {
                 p.day = day;
                 p.count = 0;
                 p.settled = false;
+                p.rent_payer = ctx.accounts.player.key();
             }
             require!(p.day == day, QuartersError::WrongDay);
             ctx.accounts.pot.to_account_info()
@@ -161,6 +173,7 @@ pub mod quarters {
         cr.bump = ctx.bumps.credit;
         cr.rent_payer = ctx.accounts.player.key();
         cr.inserted_at = Clock::get()?.unix_timestamp;
+        cr.salt = recent_slot_salt(&ctx.accounts.slot_hashes)?;
         ctx.accounts.arcade.credit_counter += 1;
 
         emit!(CoinInserted {
@@ -258,6 +271,7 @@ pub mod quarters {
                 pd.day = day;
                 pd.count = 0;
                 pd.settled = false;
+                pd.rent_payer = ctx.accounts.signer.key();
             }
             require!(pd.day == day, QuartersError::WrongDay);
             ctx.accounts.pot.to_account_info()
@@ -279,6 +293,7 @@ pub mod quarters {
         cr.bump = ctx.bumps.credit;
         cr.rent_payer = signer;
         cr.inserted_at = Clock::get()?.unix_timestamp;
+        cr.salt = recent_slot_salt(&ctx.accounts.slot_hashes)?;
         ctx.accounts.arcade.credit_counter += 1;
 
         emit!(CoinInserted {
@@ -428,6 +443,11 @@ pub mod quarters {
             QuartersError::WrongWinnerAccounts
         );
 
+        // The players present split the whole pool in the table's proportions:
+        // one player takes it all, two split 3000:1800, and so on. Only
+        // rounding dust falls through to the treasury.
+        let rank_bps = |i: usize| -> u64 { if i < 3 { PODIUM_BPS[i] } else { TAIL_BPS_TOTAL / 7 } };
+        let present_bps: u64 = (0..n).map(rank_bps).sum();
         let mut paid_total: u64 = 0;
         for (i, winner) in ctx.remaining_accounts.iter().enumerate() {
             require_keys_eq!(
@@ -435,12 +455,8 @@ pub mod quarters {
                 ctx.accounts.pot.entries[i].player,
                 QuartersError::WrongWinnerAccounts
             );
-            let bps = if i < 3 {
-                PODIUM_BPS[i]
-            } else {
-                TAIL_BPS_TOTAL / 7
-            };
-            let amount = pool * bps / 10_000;
+            let bps = rank_bps(i);
+            let amount = if present_bps == 0 { 0 } else { pool * bps / present_bps };
             **ctx.accounts.pot.to_account_info().try_borrow_mut_lamports()? -= amount;
             **winner.try_borrow_mut_lamports()? += amount;
             paid_total += amount;
@@ -495,7 +511,18 @@ pub mod quarters {
             pd.day = day;
             pd.count = 0;
             pd.settled = false;
+            pd.rent_payer = ctx.accounts.payer.key();
         }
+        Ok(())
+    }
+
+    // A credit that was never submitted within SUBMIT_WINDOW can be closed by
+    // anyone; its rent goes back to whoever fronted it. The quarter itself
+    // was already split at insert time.
+    pub fn close_expired_credit(ctx: Context<CloseExpiredCredit>) -> Result<()> {
+        let credit = &ctx.accounts.credit;
+        require!(!credit.consumed, QuartersError::CreditConsumed);
+        require!(Clock::get()?.unix_timestamp > credit.inserted_at + SUBMIT_WINDOW, QuartersError::SubmitWindow);
         Ok(())
     }
 }
@@ -542,6 +569,7 @@ pub struct DailyPot {
     pub settled: bool,
     pub count: u8,
     pub entries: [PotEntry; 10],
+    pub rent_payer: Pubkey,
 }
 
 #[account]
@@ -565,6 +593,7 @@ pub struct Credit {
     pub bump: u8,
     pub rent_payer: Pubkey,
     pub inserted_at: i64,
+    pub salt: [u8; 8],
 }
 
 #[account]
@@ -637,7 +666,7 @@ pub struct InsertCoin<'info> {
         ],
         bump
     )]
-    pub pot: Account<'info, DailyPot>,
+    pub pot: Box<Account<'info, DailyPot>>,
     #[account(
         init_if_needed,
         payer = player,
@@ -645,7 +674,7 @@ pub struct InsertCoin<'info> {
         seeds = [b"bounty".as_ref(), &[cabinet.id]],
         bump
     )]
-    pub bounty: Account<'info, Bounty>,
+    pub bounty: Box<Account<'info, Bounty>>,
     #[account(
         init,
         payer = player,
@@ -653,7 +682,7 @@ pub struct InsertCoin<'info> {
         seeds = [b"credit".as_ref(), player.key().as_ref(), &seed_commit],
         bump
     )]
-    pub credit: Account<'info, Credit>,
+    pub credit: Box<Account<'info, Credit>>,
     #[account(mut)]
     pub player: Signer<'info>,
     /// CHECK: validated against cabinet.operator in the handler
@@ -665,6 +694,9 @@ pub struct InsertCoin<'info> {
     pub system_program: Program<'info, System>,
     #[account(seeds = [b"stakes".as_ref(), &[cabinet.id]], bump = stakes.bump)]
     pub stakes: Account<'info, Stakes>,
+    /// CHECK: the SlotHashes sysvar, address-checked
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -731,12 +763,15 @@ pub struct SettlePot<'info> {
         mut,
         seeds = [b"pot".as_ref(), &[pot.cabinet_id], &pot.day.to_le_bytes()],
         bump,
-        close = treasury
+        close = pot_rent_payer
     )]
     pub pot: Account<'info, DailyPot>,
     /// CHECK: validated against arcade.treasury in the handler
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
+    /// CHECK: whoever paid the pot's rent (open_pot payer or first player) gets it back
+    #[account(mut, constraint = pot_rent_payer.key() == pot.rent_payer @ QuartersError::WrongWinnerAccounts)]
+    pub pot_rent_payer: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -765,7 +800,7 @@ pub struct StartRun<'info> {
     #[account(seeds = [b"cabinet".as_ref(), &[cabinet.id]], bump = cabinet.bump)]
     pub cabinet: Account<'info, Cabinet>,
     #[account(mut, seeds = [b"tab".as_ref(), tab.player.as_ref()], bump = tab.bump)]
-    pub tab: Account<'info, Tab>,
+    pub tab: Box<Account<'info, Tab>>,
     #[account(
         init_if_needed,
         payer = signer,
@@ -777,7 +812,7 @@ pub struct StartRun<'info> {
         ],
         bump
     )]
-    pub pot: Account<'info, DailyPot>,
+    pub pot: Box<Account<'info, DailyPot>>,
     #[account(
         init_if_needed,
         payer = signer,
@@ -785,7 +820,7 @@ pub struct StartRun<'info> {
         seeds = [b"bounty".as_ref(), &[cabinet.id]],
         bump
     )]
-    pub bounty: Account<'info, Bounty>,
+    pub bounty: Box<Account<'info, Bounty>>,
     #[account(
         init,
         payer = signer,
@@ -793,7 +828,7 @@ pub struct StartRun<'info> {
         seeds = [b"credit".as_ref(), tab.player.as_ref(), &seed_commit],
         bump
     )]
-    pub credit: Account<'info, Credit>,
+    pub credit: Box<Account<'info, Credit>>,
     #[account(mut)]
     pub signer: Signer<'info>,
     /// CHECK: validated against cabinet.operator in the handler
@@ -805,6 +840,9 @@ pub struct StartRun<'info> {
     pub system_program: Program<'info, System>,
     #[account(seeds = [b"stakes".as_ref(), &[cabinet.id]], bump = stakes.bump)]
     pub stakes: Account<'info, Stakes>,
+    /// CHECK: the SlotHashes sysvar, address-checked
+    #[account(address = anchor_lang::solana_program::sysvar::slot_hashes::ID)]
+    pub slot_hashes: UncheckedAccount<'info>,
 }
 
 #[derive(Accounts)]
@@ -937,4 +975,18 @@ pub struct OpenPot<'info> {
     #[account(mut)]
     pub payer: Signer<'info>,
     pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct CloseExpiredCredit<'info> {
+    #[account(
+        mut,
+        close = rent_payer,
+        seeds = [b"credit".as_ref(), credit.player.as_ref(), &credit.seed_commit],
+        bump = credit.bump
+    )]
+    pub credit: Account<'info, Credit>,
+    /// CHECK: rent refund destination; must be whoever fronted the rent
+    #[account(mut, constraint = rent_payer.key() == credit.rent_payer @ QuartersError::WrongPlayer)]
+    pub rent_payer: UncheckedAccount<'info>,
 }

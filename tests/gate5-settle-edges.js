@@ -76,6 +76,7 @@ function swarmMasks(seed) {
     const PID = program.programId;
     const pda = (seeds) => anchor.web3.PublicKey.findProgramAddressSync(seeds, PID)[0];
     const arcadePda = pda([Buffer.from("arcade")]);
+    const rentPayerOf = async (pk) => { try { return (await program.account.dailyPot.fetch(pk)).rentPayer; } catch (e) { return payerKp.publicKey; } };
     const _vk5 = anchor.web3.Keypair.fromSecretKey(Uint8Array.from(JSON.parse(fs.readFileSync(path.join(__dirname, "../verifier/verifier-solana-devnet.json")))));
     // Throwaway treasury seeded above the rent floor so payouts/fees don't net against the payer.
     const _tk = anchor.web3.Keypair.generate();
@@ -111,7 +112,7 @@ function swarmMasks(seed) {
       const seed = coin.seed;
       const run = swarmMasks(seed);
       const resp = await cashier.submit(URL, {
-        creditId: coin.creditId, game: "swarm", seed, secret: coin.secret,
+        creditId: coin.creditId, game: "swarm", seed, secret: coin.secret, salt: coin.salt,
         inputsRLE: Swarm.encodeRLE(run.masks),
         claimedScore: run.score, claimedHash: run.hash,
       });
@@ -126,22 +127,27 @@ function swarmMasks(seed) {
       `count=${pot4Acct.count}`);
 
     // --- roll the period over ---
+    // Snapshot both pots now: settlement is permissionless and the hosted
+    // daemon may settle them the moment the grace expires.
+    const rent3 = await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot3)).data.length);
+    const pool3 = (await conn.getBalance(pot3)) - rent3;
+    const rent4 = await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot4)).data.length);
+    const pool4 = (await conn.getBalance(pot4)) - rent4;
+    const rentBackB = pot4Acct.rentPayer.equals(payerKp.publicKey) ? rent4 : 0;
     console.log(`  (waiting ${untilBoundary() + 3 + Math.min(900, Math.floor(PERIOD / 4))}s for the period to end + settle grace)`);
     await sleep((untilBoundary() + 3 + Math.min(900, Math.floor(PERIOD / 4))) * 1000);
 
-    const rent3 = (await conn.getAccountInfo(pot3)).lamports && await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot3)).data.length);
-    const pool3 = (await conn.getBalance(pot3)) - rent3;
     const treasuryBefore = await conn.getBalance(arcade.treasury);
 
     // --- A: settle the 0-winner pot ---
     await program.methods.settlePot()
-      .accounts({ arcade: arcadePda, pot: pot3, treasury: arcade.treasury })
+      .accounts({ arcade: arcadePda, pot: pot3, treasury: arcade.treasury, potRentPayer: await rentPayerOf(pot3) })
       .remainingAccounts([])
       .rpc();
     await sleep(1500);
     const treasuryAfterA = await conn.getBalance(arcade.treasury);
     const pot3After = await conn.getBalance(pot3);
-    check("A: 0-winner pool + pot rent sweep to treasury exactly", treasuryAfterA - treasuryBefore === pool3 + rent3,
+    check("A: 0-winner pool sweeps to treasury exactly (rent returns to the pot opener)", treasuryAfterA - treasuryBefore === pool3,
       `pool=${pool3} treasury+=${treasuryAfterA - treasuryBefore}`);
     check("A: pot closed after settle (rent back to treasury)", pot3After === 0, `pot=${pot3After}`);
 
@@ -149,7 +155,7 @@ function swarmMasks(seed) {
     let doubleRejected = false;
     try {
       await program.methods.settlePot()
-        .accounts({ arcade: arcadePda, pot: pot3, treasury: arcade.treasury })
+        .accounts({ arcade: arcadePda, pot: pot3, treasury: arcade.treasury, potRentPayer: await rentPayerOf(pot3) })
         .remainingAccounts([]).rpc();
     } catch (e) { doubleRejected = /PotSettled|already/i.test(String(e)) || true; }
     check("D: double-settle rejected", doubleRejected);
@@ -159,7 +165,7 @@ function swarmMasks(seed) {
     let wrongCount = false;
     try {
       await program.methods.settlePot()
-        .accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury })
+        .accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury, potRentPayer: await rentPayerOf(pot4) })
         .remainingAccounts(winners4.slice(0, 3)).rpc();
     } catch (e) { wrongCount = true; }
     check("C: wrong winner count rejected", wrongCount);
@@ -167,31 +173,32 @@ function swarmMasks(seed) {
     try {
       const bad = winners4.slice();
       bad[0] = { pubkey: PID, isSigner: false, isWritable: true };   // not the leader
-      await program.methods.settlePot()
-        .accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury })
-        .remainingAccounts(bad).rpc();
+      { const _p = await program.account.dailyPot.fetch(pot4).catch(() => null);
+      if (_p) await program.methods.settlePot().accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury, potRentPayer: _p.rentPayer }).remainingAccounts(bad).rpc();
+      else console.log("  (pot pot4 already settled by the daemon — permissionless; checking payouts by balance)"); }
     } catch (e) { wrongOrder = true; }
     check("C: wrong winner identity rejected", wrongOrder);
 
     // --- B: settle the 4-winner pot; tail branch pays 4th place ---
-    const rent4 = await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot4)).data.length);
-    const pool4 = (await conn.getBalance(pot4)) - rent4;
     const payerBefore = await conn.getBalance(payerKp.publicKey);
     const treasuryBeforeB = await conn.getBalance(arcade.treasury);
-    const sig = await program.methods.settlePot()
-      .accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury })
-      .remainingAccounts(winners4).rpc();
+    const _p4 = await program.account.dailyPot.fetch(pot4).catch(() => null);
+    const sig = _p4
+      ? await program.methods.settlePot().accounts({ arcade: arcadePda, pot: pot4, treasury: arcade.treasury, potRentPayer: _p4.rentPayer }).remainingAccounts(winners4).rpc()
+      : (console.log("  (pot4 already settled by the daemon — permissionless; checking payouts by balance)"), null);
     await sleep(1500);
+    const PRESENT4 = PODIUM[0] + PODIUM[1] + PODIUM[2] + TAIL_EACH;   // v4: the 4 present players split the pool
     const expectPayer = [PODIUM[0], PODIUM[1], PODIUM[2], TAIL_EACH]
-      .reduce((a, bps) => a + Math.floor(pool4 * bps / 10_000), 0);
+      .reduce((a, bps) => a + Math.floor(pool4 * bps / PRESENT4), 0);
+    const expectPayerTotal = expectPayer + rentBackB;
     const expectTreasury = pool4 - expectPayer;
     const payerAfter = await conn.getBalance(payerKp.publicKey);
     const treasuryAfterB = await conn.getBalance(arcade.treasury);
     const fee = 5000;   // payer signed the settle tx
-    check("B: podium + tail paid exactly (4th place gets 400/7 bps)",
-      payerAfter - payerBefore === expectPayer - fee,
-      `got ${payerAfter - payerBefore + fee}, want ${expectPayer} of pool ${pool4}`);
-    check("B: rounding leftover + pot rent to treasury exactly", treasuryAfterB - treasuryBeforeB === expectTreasury + rent4,
+    check("B: 4 present players split the pool in table proportions",
+      payerAfter - payerBefore === expectPayerTotal - fee,
+      `got ${payerAfter - payerBefore + fee}, want ${expectPayerTotal} (split ${expectPayer} + pot rent back ${rentBackB}) of pool ${pool4}`);
+    check("B: only rounding leftover to treasury", treasuryAfterB - treasuryBeforeB === expectTreasury,
       `got ${treasuryAfterB - treasuryBeforeB}, want ${expectTreasury}`);
     console.log(`  (settle tx ${sig.slice(0, 14)}…)`);
   } catch (e) {

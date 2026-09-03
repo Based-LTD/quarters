@@ -141,7 +141,7 @@ async function settleSweep() {
         const winners = pot.entries.slice(0, pot.count).map((e) => ({ pubkey: e.player, isWritable: true, isSigner: false }));
         try {
           const sig = await program.methods.settlePot()
-            .accounts({ arcade: arcadePda, pot: pk, treasury: arcade.treasury })
+            .accounts({ arcade: arcadePda, pot: pk, treasury: arcade.treasury, potRentPayer: pot.rentPayer })   // v4: pot rent goes back to whoever opened it
             .remainingAccounts(winners)
             .rpc();
           settle.settled++; pending--;
@@ -210,6 +210,9 @@ async function chainSubmit(creditIdB58, body, result) {
   const commit = crypto.createHash("sha256").update(Buffer.from(body.secret, "hex")).digest();
   if (!commit.equals(Buffer.from(credit.seedCommit))) {
     return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
+  }
+  if (Buffer.from(credit.salt).toString("hex") !== String(body.salt).toLowerCase()) {
+    return { ok: false, code: 422, reason: "salt does not match the credit" };
   }
 
   // The published replay hash: sha256 over the canonical replay record.
@@ -306,8 +309,12 @@ function verifyRun(body) {
   const secret = body.secret;
   if (typeof secret !== "string" || !/^[0-9a-f]{64}$/i.test(secret)) return { ok: false, reason: "bad secret" };
   const commitBuf = crypto.createHash("sha256").update(Buffer.from(secret, "hex")).digest();
-  const derivedSeed = commitBuf.readInt32LE(0);
-  if ((seed | 0) !== derivedSeed) return { ok: false, reason: "seed does not derive from secret" };
+  // v4: the seed also mixes the credit's on-chain salt (verified against the
+  // chain in chainSubmit); the client sends it so the replay is self-contained.
+  const salt = body.salt;
+  if (typeof salt !== "string" || !/^[0-9a-f]{16}$/i.test(salt)) return { ok: false, reason: "bad salt" };
+  const derivedSeed = crypto.createHash("sha256").update(Buffer.concat([commitBuf, Buffer.from(salt, "hex")])).digest().readInt32LE(0);
+  if ((seed | 0) !== derivedSeed) return { ok: false, reason: "seed does not derive from secret+salt" };
   const commit = commitBuf.toString("hex");
 
   const masks = Engine.decodeRLE(inputsRLE);
@@ -552,7 +559,7 @@ const server = http.createServer((req, res) => {
       // The receipt: everything anyone needs to re-run the verification.
       fs.writeFileSync(
         path.join(RECEIPTS_DIR, `${parsed.creditId}.json`),
-        JSON.stringify({ creditId: parsed.creditId, game: parsed.game, seed: parsed.seed, secret: parsed.secret, inputsRLE: parsed.inputsRLE,
+        JSON.stringify({ creditId: parsed.creditId, game: parsed.game, seed: parsed.seed, secret: parsed.secret, salt: parsed.salt, inputsRLE: parsed.inputsRLE,
           claimedScore: parsed.claimedScore, claimedHash: parsed.claimedHash, engineHash: ENGINE_HASH[parsed.game], verdict, onchain }, null, 1)
       );
       return send(200, { verified: true, verdict, onchain, signed: signVerdict(verdict), tas: result.tas });

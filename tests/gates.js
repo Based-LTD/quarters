@@ -102,7 +102,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Point both cabinets' operator at this run's treasury (the deed hook); restored at exit.
   const _origOperators = {};
   for (const id of [1, 2]) _origOperators[id] = (await program.account.cabinet.fetch(cabinetPda(id))).operator;
-  globalThis._restoreOperators = async () => { for (const id of [1, 2]) { try { await program.methods.setOperator(_origOperators[id]).accounts({ arcade: arcadePda, cabinet: cabinetPda(id), authority: payerKp.publicKey }).rpc({ commitment: "finalized" }); } catch (e) { console.log("  (operator restore failed for cab " + id + ")"); } } console.log("  (cabinet operators restored)"); };
+  // restore to the HOUSE (payer), not to whatever was captured — a fatal in an earlier run can leave a throwaway there
+  globalThis._restoreOperators = async () => { for (const id of [1, 2]) { try { await program.methods.setOperator(payerKp.publicKey).accounts({ arcade: arcadePda, cabinet: cabinetPda(id), authority: payerKp.publicKey }).rpc(); } catch (e) { console.log("  (operator restore failed for cab " + id + ")"); } } console.log("  (cabinet operators restored)"); };
   for (const id of [1, 2]) {
     await program.methods
       .setOperator(treasury.publicKey)
@@ -125,7 +126,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   }
   const day = Math.floor(Date.now() / 1000 / PERIOD);
   const pot1 = potPda(1, day);
-  const potRentUnit = await conn.getMinimumBalanceForRentExemption(8 + 727);   // a settled pot closes its rent to the treasury
 
   async function insertCoin(playerKp2, cabId, commitByte) {
     const commit = commitFor(commitByte);
@@ -137,6 +137,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
         arcade: arcadePda,
         cabinet: cabinetPda(cabId),
         stakes: stakesPda(cabId),
+        slotHashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY,
         pot: potPda(cabId, Math.floor(Date.now() / 1000 / PERIOD)),
         bounty: bountyPda(cabId),
         credit,
@@ -162,7 +163,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   // Pot PDA rent was paid at first init; measure the 70% cuts net of it.
   check("gate1: pot received 3 x 70%", potGain >= 3 * QUARTER * 0.7, `potGain=${potGain}`);
   // Operator == treasury pre-deeds, so treasury collects operator + house = 30%/coin.
-  check("gate1: treasury received 3 x 30% (± pots the daemon closed to it mid-test)", (treGain - 2250000) >= 0 && ((treGain - 2250000) % potRentUnit === 0), `treGain=${treGain}`);
+  check("gate1: treasury received 3 x 30%", treGain === 2250000, `treGain=${treGain}`);
 
   // ---- Gate 2: verifier-signed leaderboard ----
   async function submitScore(credit, score) {
@@ -179,7 +180,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       .signers([verifier])
       .rpc();
   }
-  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 119); // Credit::INIT_SPACE = 119 (v3: + inserted_at)
+  const creditRent = await conn.getMinimumBalanceForRentExemption(8 + 127); // Credit::INIT_SPACE = 119 (v3: + inserted_at)
   const p0PreSubmit = await conn.getBalance(players[0].publicKey);
   await submitScore(credits[0], 100);
   const p0PostSubmit = await conn.getBalance(players[0].publicKey);
@@ -255,7 +256,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     try {
       await program.methods
         .settlePot()
-        .accounts({ arcade: arcadePda, pot: pot1, treasury: treasury.publicKey })
+        .accounts({ arcade: arcadePda, pot: pot1, treasury: treasury.publicKey, potRentPayer: (await program.account.dailyPot.fetch(pot1)).rentPayer })
         .remainingAccounts([
           { pubkey: players[1].publicKey, isSigner: false, isWritable: true },
           { pubkey: players[2].publicKey, isSigner: false, isWritable: true },
@@ -274,9 +275,12 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const potLamports = await conn.getBalance(pot1);
     const rent = await conn.getMinimumBalanceForRentExemption(potAcc ? 8 + 727 : 0).catch(() => 0);
 
+    const _potBefore = await program.account.dailyPot.fetch(pot1);
+    const potRentUnit = await conn.getMinimumBalanceForRentExemption((await conn.getAccountInfo(pot1)).data.length);   // v4: returned to the pot opener at settle
+    const rentPayerIdx = players.findIndex((p) => p.publicKey.equals(_potBefore.rentPayer));
     await program.methods
       .settlePot()
-      .accounts({ arcade: arcadePda, pot: pot1, treasury: treasury.publicKey })
+      .accounts({ arcade: arcadePda, pot: pot1, treasury: treasury.publicKey, potRentPayer: (await program.account.dailyPot.fetch(pot1)).rentPayer })
       .remainingAccounts([
         { pubkey: players[1].publicKey, isSigner: false, isWritable: true },
         { pubkey: players[2].publicKey, isSigner: false, isWritable: true },
@@ -287,18 +291,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const balsAfter = await Promise.all(players.map((p) => conn.getBalance(p.publicKey)));
     const treAfter2 = await conn.getBalance(treasury.publicKey);
     const gains = balsAfter.map((b, i) => b - balsBefore[i]);
+    if (rentPayerIdx >= 0) gains[rentPayerIdx] -= potRentUnit;   // v4: pot rent returns to whoever opened the pot
     // players order [p0=3rd, p1=1st, p2=2nd]
     check("gate3: payout order 1st>2nd>3rd", gains[1] > gains[2] && gains[2] > gains[0],
       `1st=${gains[1]} 2nd=${gains[2]} 3rd=${gains[0]}`);
     check("gate3: ratios ~30/18/12 of pool",
-      Math.abs(gains[1] * 18 - gains[2] * 30) < 60 && Math.abs(gains[2] * 12 - gains[0] * 18) < 60);
-    check("gate3: unpaid tail went to treasury", treAfter2 > treBefore2, `treasury +${treAfter2 - treBefore2}`);
+      Math.abs(gains[1] * 18 - gains[2] * 30) < 60 && Math.abs(gains[2] * 12 - gains[0] * 18) < 60,
+      `gains=${gains.join(",")} rentPayerIdx=${rentPayerIdx} potRentUnit=${potRentUnit}`);
+    check("gate3: only rounding dust reaches the treasury (present players split the pool)", treAfter2 - treBefore2 >= 0 && treAfter2 - treBefore2 < 10, `treasury +${treAfter2 - treBefore2}`);
 
     let doubleSettle = false;
     try {
       await program.methods
         .settlePot()
-        .accounts({ arcadePda, pot: pot1, treasury: treasury.publicKey })
+        .accounts({ arcadePda, pot: pot1, treasury: treasury.publicKey, potRentPayer: (await program.account.dailyPot.fetch(pot1)).rentPayer })
         .remainingAccounts([])
         .rpc();
     } catch (e) { doubleSettle = true; }

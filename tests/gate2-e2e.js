@@ -99,7 +99,7 @@ function post(pathName, body) {
   // the engine seed is the commitment's first four bytes.
   const secret = crypto.randomBytes(32);
   const seedCommit = crypto.createHash("sha256").update(secret).digest();
-  const seed = seedCommit.readInt32LE(0);
+  let seed = 0, saltHex = "";   // v4: derived after the coin lands (needs the credit's salt)
   const stakesPk = PublicKey.findProgramAddressSync([Buffer.from("stakes"), Buffer.from([1])], PID)[0];
 
   const arcade = await program.account.arcade.fetch(arcadePda);
@@ -116,7 +116,7 @@ function post(pathName, body) {
     .insertCoin(Array.from(seedCommit))
     .accounts({
       arcade: arcadePda,
-      cabinet: cabinetPda, stakes: stakesPk,
+      cabinet: cabinetPda, stakes: stakesPk, slotHashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY,
       pot: potPk,
       bounty: bountyPda,
       credit: creditPk,
@@ -126,6 +126,8 @@ function post(pathName, body) {
       systemProgram: SystemProgram.programId,
     })
     .rpc();
+  { const cr = await program.account.credit.fetch(creditPk); saltHex = Buffer.from(cr.salt).toString("hex");
+    seed = crypto.createHash("sha256").update(Buffer.concat([seedCommit, Buffer.from(cr.salt)])).digest().readInt32LE(0); }
   check("coin inserted with committed seed", true, `credit=${creditPk.toBase58().slice(0, 8)}…`);
 
   // --- play the game with that exact seed ---
@@ -152,7 +154,7 @@ function post(pathName, body) {
     inputsRLE: VoidRocks.encodeRLE(masks),
     claimedScore: played.score,
     claimedHash: played.hash,
-    secret: secret.toString("hex"),
+    secret: secret.toString("hex"), salt: saltHex,
   };
   const balBefore = await conn.getBalance(payerKp.publicKey);
   const resp = await post("/submit", submission);
@@ -185,7 +187,7 @@ function post(pathName, body) {
     await program.methods
       .insertCoin(Array.from(seedCommit))    // committed to the OLD secret
       .accounts({
-        arcade: arcadePda, cabinet: cabinetPda, stakes: stakesPk, pot: potPk, bounty: bountyPda,
+        arcade: arcadePda, cabinet: cabinetPda, stakes: stakesPk, slotHashes: anchor.web3.SYSVAR_SLOT_HASHES_PUBKEY, pot: potPk, bounty: bountyPda,
         credit: credit2, player: payerKp.publicKey, operator: cab.operator,
         treasury: arcade.treasury, systemProgram: SystemProgram.programId,
       })
@@ -193,7 +195,7 @@ function post(pathName, body) {
     // An internally-consistent run for the WRONG seed: passes offline replay
     // verification, must die at the on-chain commitment check.
     const secret2 = crypto.randomBytes(32);
-    const seed2 = crypto.createHash("sha256").update(secret2).digest().readInt32LE(0);
+    const seed2 = crypto.createHash("sha256").update(Buffer.concat([crypto.createHash("sha256").update(secret2).digest(), Buffer.from(saltHex, "hex")])).digest().readInt32LE(0);
     const s2 = VoidRocks.createState(seed2);
     const masks2 = [];
     let tr2 = seed2 | 0, cur2 = 0;
@@ -208,7 +210,7 @@ function post(pathName, body) {
     const cheat = await post("/submit", {
       creditId: credit2.toBase58(),
       game: "voidrocks",
-      seed: seed2, secret: secret2.toString("hex"),
+      seed: seed2, secret: secret2.toString("hex"), salt: saltHex,
       inputsRLE: VoidRocks.encodeRLE(masks2),
       claimedScore: s2.score,
       claimedHash: VoidRocks.stateHash(s2),
