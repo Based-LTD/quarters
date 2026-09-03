@@ -68,8 +68,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       await sleep((untilBoundary + 2) * 1000);
     }
 
-    const seed = (Date.now() ^ 0xca5e) | 0;
-    const coin = await cashier.insertCoin(1, seed);
+    const coin = await cashier.insertCoin(1);
+    const seed = coin.seed;
     check("cashier core inserted a coin", !!coin.creditId && !!coin.txSig,
       `credit=${coin.creditId.slice(0, 8)}… quarter=${coin.quarterLamports} lamports`);
 
@@ -89,7 +89,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const resp = await cashier.submit(URL, {
       creditId: coin.creditId,
       game: "voidrocks",
-      seed,
+      seed, secret: coin.secret,
       inputsRLE: VoidRocks.encodeRLE(masks),
       claimedScore: s.score,
       claimedHash: VoidRocks.stateHash(s),
@@ -116,8 +116,8 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     check("core opened a 3-credit tab + session float", !!tabOpen.txSig && tabInfo0 && tabInfo0.creditsLeft === 3,
       `credits=${tabInfo0 && tabInfo0.creditsLeft}`);
 
-    const seed2 = (Date.now() ^ 0x7ab) | 0;
-    const run = await cashier.startRun(sessionWallet, 25, seed2);
+    const run = await cashier.startRun(sessionWallet, 25);
+    const seed2 = run.seed;
     check("session-signed start_run (no popup path)", !!run.creditId && !!run.txSig,
       `credit=${run.creditId.slice(0, 8)}…`);
 
@@ -135,7 +135,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     const resp2 = await cashier.submit(URL, {
       creditId: run.creditId,
       game: "coil",
-      seed: seed2,
+      seed: seed2, secret: run.secret,
       inputsRLE: Coil.encodeRLE(cmasks),
       claimedScore: cs.score,
       claimedHash: Coil.stateHash(cs),

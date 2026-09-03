@@ -93,17 +93,17 @@ function post(pathName, body) {
   }
 
   // --- the "browser": commit a seed and pay the quarter ---
-  const seed = (Date.now() ^ 0x5eed) | 0;
-  const seedBuf = Buffer.alloc(4);
-  seedBuf.writeInt32LE(seed);
-  const seedCommit = crypto.createHash("sha256").update(seedBuf).digest();
+  // v3: a 32-byte secret; its sha256 is the commitment AND the credit PDA seed;
+  // the engine seed is the commitment's first four bytes.
+  const secret = crypto.randomBytes(32);
+  const seedCommit = crypto.createHash("sha256").update(secret).digest();
+  const seed = seedCommit.readInt32LE(0);
+  const stakesPk = PublicKey.findProgramAddressSync([Buffer.from("stakes"), Buffer.from([1])], PID)[0];
 
   const arcade = await program.account.arcade.fetch(arcadePda);
   const cab = await program.account.cabinet.fetch(cabinetPda);
-  const ib = Buffer.alloc(8);
-  ib.writeBigUInt64LE(BigInt(arcade.creditCounter.toNumber()));
   const creditPk = PublicKey.findProgramAddressSync(
-    [Buffer.from("credit"), payerKp.publicKey.toBuffer(), ib], PID)[0];
+    [Buffer.from("credit"), payerKp.publicKey.toBuffer(), seedCommit], PID)[0];
   const day = Math.floor(Date.now() / 1000 / PERIOD);
   const dayBuf = Buffer.alloc(4);
   dayBuf.writeUInt32LE(day);
@@ -114,7 +114,7 @@ function post(pathName, body) {
     .insertCoin(Array.from(seedCommit))
     .accounts({
       arcade: arcadePda,
-      cabinet: cabinetPda, stakes: null,
+      cabinet: cabinetPda, stakes: stakesPk,
       pot: potPk,
       bounty: bountyPda,
       credit: creditPk,
@@ -150,6 +150,7 @@ function post(pathName, body) {
     inputsRLE: VoidRocks.encodeRLE(masks),
     claimedScore: played.score,
     claimedHash: played.hash,
+    secret: secret.toString("hex"),
   };
   const balBefore = await conn.getBalance(payerKp.publicKey);
   const resp = await post("/submit", submission);
@@ -177,22 +178,20 @@ function post(pathName, body) {
 
   // --- abuse: pay a new coin but submit with a different seed ---
   {
-    const arcade2 = await program.account.arcade.fetch(arcadePda);
-    const ib2 = Buffer.alloc(8);
-    ib2.writeBigUInt64LE(BigInt(arcade2.creditCounter.toNumber()));
-    const credit2 = PublicKey.findProgramAddressSync(
-      [Buffer.from("credit"), payerKp.publicKey.toBuffer(), ib2], PID)[0];
+    // the first credit was closed on submit, so its PDA (same commit) is free again
+    const credit2 = creditPk;
     await program.methods
-      .insertCoin(Array.from(seedCommit))    // committed to the OLD seed
+      .insertCoin(Array.from(seedCommit))    // committed to the OLD secret
       .accounts({
-        arcade: arcadePda, cabinet: cabinetPda, stakes: null, pot: potPk, bounty: bountyPda,
+        arcade: arcadePda, cabinet: cabinetPda, stakes: stakesPk, pot: potPk, bounty: bountyPda,
         credit: credit2, player: payerKp.publicKey, operator: cab.operator,
         treasury: arcade.treasury, systemProgram: SystemProgram.programId,
       })
       .rpc();
     // An internally-consistent run for the WRONG seed: passes offline replay
     // verification, must die at the on-chain commitment check.
-    const seed2 = seed + 1;
+    const secret2 = crypto.randomBytes(32);
+    const seed2 = crypto.createHash("sha256").update(secret2).digest().readInt32LE(0);
     const s2 = VoidRocks.createState(seed2);
     const masks2 = [];
     let tr2 = seed2 | 0, cur2 = 0;
@@ -207,7 +206,7 @@ function post(pathName, body) {
     const cheat = await post("/submit", {
       creditId: credit2.toBase58(),
       game: "voidrocks",
-      seed: seed2,
+      seed: seed2, secret: secret2.toString("hex"),
       inputsRLE: VoidRocks.encodeRLE(masks2),
       claimedScore: s2.score,
       claimedHash: VoidRocks.stateHash(s2),

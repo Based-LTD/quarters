@@ -44,32 +44,7 @@
         },
         {
           "name": "credit",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  114,
-                  101,
-                  100,
-                  105,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "credit.player",
-                "account": "Credit"
-              },
-              {
-                "kind": "account",
-                "path": "credit.index",
-                "account": "Credit"
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "bounty",
@@ -342,9 +317,8 @@
                 "path": "player"
               },
               {
-                "kind": "account",
-                "path": "arcade.credit_counter",
-                "account": "Arcade"
+                "kind": "arg",
+                "path": "seed_commit"
               }
             ]
           }
@@ -367,8 +341,7 @@
           "address": "11111111111111111111111111111111"
         },
         {
-          "name": "stakes",
-          "optional": true
+          "name": "stakes"
         }
       ],
       "args": [
@@ -380,6 +353,61 @@
               32
             ]
           }
+        }
+      ]
+    },
+    {
+      "name": "open_pot",
+      "discriminator": [
+        199,
+        125,
+        132,
+        148,
+        93,
+        55,
+        11,
+        145
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "cabinet"
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "payer",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "day",
+          "type": "u32"
         }
       ]
     },
@@ -678,9 +706,8 @@
                 "account": "Tab"
               },
               {
-                "kind": "account",
-                "path": "arcade.credit_counter",
-                "account": "Arcade"
+                "kind": "arg",
+                "path": "seed_commit"
               }
             ]
           }
@@ -703,8 +730,7 @@
           "address": "11111111111111111111111111111111"
         },
         {
-          "name": "stakes",
-          "optional": true
+          "name": "stakes"
         }
       ],
       "args": [
@@ -756,32 +782,7 @@
         },
         {
           "name": "credit",
-          "writable": true,
-          "pda": {
-            "seeds": [
-              {
-                "kind": "const",
-                "value": [
-                  99,
-                  114,
-                  101,
-                  100,
-                  105,
-                  116
-                ]
-              },
-              {
-                "kind": "account",
-                "path": "credit.player",
-                "account": "Credit"
-              },
-              {
-                "kind": "account",
-                "path": "credit.index",
-                "account": "Credit"
-              }
-            ]
-          }
+          "writable": true
         },
         {
           "name": "pot",
@@ -1081,16 +1082,21 @@
     },
     {
       "code": 6011,
+      "name": "SubmitWindow",
+      "msg": "credit's submit window has passed"
+    },
+    {
+      "code": 6012,
       "name": "WrongWinnerAccounts",
       "msg": "winner accounts do not match leaderboard"
     },
     {
-      "code": 6012,
+      "code": 6013,
       "name": "NotSession",
       "msg": "signer is neither the tab's session key nor its owner"
     },
     {
-      "code": 6013,
+      "code": 6014,
       "name": "TabEmpty",
       "msg": "tab balance cannot cover a quarter"
     }
@@ -1309,6 +1315,10 @@
           {
             "name": "rent_payer",
             "type": "pubkey"
+          },
+          {
+            "name": "inserted_at",
+            "type": "i64"
           }
         ]
       }

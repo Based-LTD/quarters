@@ -59,6 +59,10 @@ function honestRun(seed) {
   return { masks, score: s.score, hash: VoidRocks.stateHash(s) };
 }
 
+// v3 protocol: a 32-byte secret; sha256(secret) is the commitment and the
+// engine seed is its first four bytes.
+const SECRET = Buffer.alloc(32, 7);
+const COMMIT = crypto.createHash("sha256").update(SECRET).digest();
 function commitOf(seed) {
   const b = Buffer.alloc(4);
   b.writeInt32LE(seed | 0);
@@ -69,12 +73,12 @@ function commitOf(seed) {
   await new Promise((r) => server.listen(0, r));
   const port = server.address().port;
 
-  const seed = 424242;
+  const seed = COMMIT.readInt32LE(0);
   const run = honestRun(seed);
   const base = {
     creditId: "credit-test-1",
     game: "voidrocks",
-    seed,
+    seed, secret: SECRET.toString("hex"),
     seedCommit: commitOf(seed),
     inputsRLE: VoidRocks.encodeRLE(run.masks),
     claimedScore: run.score,
@@ -108,7 +112,7 @@ function commitOf(seed) {
     const bot = await post(port, "/submit", {
       creditId: "credit-test-5",
       game: "voidrocks",
-      seed,
+      seed, secret: SECRET.toString("hex"),
       seedCommit: commitOf(seed),
       inputsRLE: VoidRocks.encodeRLE(masks),
       claimedScore: s.score,

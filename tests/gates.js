@@ -63,11 +63,10 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     d.writeUInt32LE(day);
     return PublicKey.findProgramAddressSync([Buffer.from("pot"), Buffer.from([id]), d], PID)[0];
   };
-  const creditPda = (player, index) => {
-    const ib = Buffer.alloc(8);
-    ib.writeBigUInt64LE(BigInt(index));
-    return PublicKey.findProgramAddressSync([Buffer.from("credit"), player.toBuffer(), ib], PID)[0];
-  };
+  // v3: credit PDA is seeded by the commitment; every cabinet has a Stakes PDA
+  const creditPda = (player, commit) => PublicKey.findProgramAddressSync([Buffer.from("credit"), player.toBuffer(), commit], PID)[0];
+  const stakesPda = (id) => PublicKey.findProgramAddressSync([Buffer.from("stakes"), Buffer.from([id])], PID)[0];
+  const commitFor = (tag) => { const b = Buffer.alloc(32); b.writeUInt32LE((Date.now() ^ (tag * 2654435761)) >>> 0, 0); b[4] = tag & 255; return require("crypto").createHash("sha256").update(b).digest(); };
   const gameName = (s) => {
     const b = Buffer.alloc(16);
     b.write(s);
@@ -121,16 +120,15 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const pot1 = potPda(1, day);
 
   async function insertCoin(playerKp2, cabId, commitByte) {
-    const arcade = await program.account.arcade.fetch(arcadePda);
-    const index = arcade.creditCounter.toNumber();
-    const credit = creditPda(playerKp2.publicKey, index);
+    const commit = commitFor(commitByte);
+    const credit = creditPda(playerKp2.publicKey, commit);
     const cab = await program.account.cabinet.fetch(cabinetPda(cabId));
     await program.methods
-      .insertCoin(Array(32).fill(commitByte))
+      .insertCoin(Array.from(commit))
       .accounts({
         arcade: arcadePda,
         cabinet: cabinetPda(cabId),
-        stakes: null,
+        stakes: stakesPda(cabId),
         pot: potPda(cabId, Math.floor(Date.now() / 1000 / PERIOD)),
         bounty: bountyPda(cabId),
         credit,

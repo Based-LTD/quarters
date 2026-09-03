@@ -98,16 +98,16 @@ function swarmMasks(seed) {
     const pot3 = potPda(3, day), pot4 = potPda(4, day);
 
     // --- A setup: one coin on cabinet 3, never verified ---
-    await cashier.insertCoin(3, (Date.now() ^ 0xa) | 0);
+    await cashier.insertCoin(3) ^ 0xa) | 0);
     console.log("  (cab 3: 1 coin, no submit — the ghost pot)");
 
     // --- B setup: four verified scores on cabinet 4, same wallet ---
     for (let i = 0; i < 4; i++) {
-      const seed = (Date.now() ^ (0xb0 + i)) | 0;
-      const coin = await cashier.insertCoin(4, seed);
+      const coin = await cashier.insertCoin(4);
+      const seed = coin.seed;
       const run = swarmMasks(seed);
       const resp = await cashier.submit(URL, {
-        creditId: coin.creditId, game: "swarm", seed,
+        creditId: coin.creditId, game: "swarm", seed, secret: coin.secret,
         inputsRLE: Swarm.encodeRLE(run.masks),
         claimedScore: run.score, claimedHash: run.hash,
       });

@@ -50,6 +50,13 @@ const GAMES = {
 const ENGINE_HASH = Object.fromEntries(Object.keys(GAMES).map((g) => [g,
   crypto.createHash("sha256").update(fs.readFileSync(path.join(__dirname, "..", "engine", g + ".js"))).digest("hex").slice(0, 16)]));
 
+process.on("uncaughtException", (e) => { console.log("UNCAUGHT " + String(e && e.stack || e).slice(0, 300)); });
+const STARTED_AT = Date.now();
+const readCache = { lb: null };
+const submitHits = new Map();   // ip → [timestamps]
+setInterval(() => { const now = Date.now(); for (const [k, v] of submitHits) { const keep = v.filter((t) => now - t < 60_000); if (keep.length) submitHits.set(k, keep); else submitHits.delete(k); } }, 60_000).unref();
+const inFlight = new Set();     // creditIds being verified right now
+
 const RECEIPTS_DIR = process.env.RECEIPTS_DIR || path.join(__dirname, "receipts");
 const KEY_FILE = process.env.VERIFIER_KEY_FILE || path.join(__dirname, "verifier-key.json");
 const REVIEW_SCORE = 0x7fffffff; // v1: no auto-payout gate on-chain yet
@@ -97,7 +104,8 @@ if (process.env.DEVNET_SUBMIT === "1") {
     return anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("pot"), Buffer.from([cabId]), d], PID)[0];
   };
   const arcadePda = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID)[0];
-  chain = { anchor, program, kp, conn, potPda, arcadePda };
+  const cabinetPda = (id) => anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("cabinet"), Buffer.from([id])], PID)[0];
+  chain = { anchor, program, kp, conn, potPda, arcadePda, cabinetPda, cabinetGame: new Map() };
   console.log("devnet submit mode: verifier", kp.publicKey.toBase58(), "program", PID.toBase58());
 }
 
@@ -139,6 +147,19 @@ async function settleSweep() {
       }
     }
     settle.pending = pending;
+    // House pays the pot rent: pre-open this and next period's pots.
+    if (program.methods.openPot) {
+      for (const day of [nowDay, nowDay + 1]) {
+        for (let cab = 1; cab <= MAX_CAB; cab++) {
+          const pk = potPda(cab, day);
+          try { const info = await conn.getAccountInfo(pk); if (info) continue; } catch (e) { continue; }
+          try {
+            await program.methods.openPot(day).accounts({ arcade: arcadePda, cabinet: chain.cabinetPda(cab), pot: pk, payer: kp.publicKey, systemProgram: anchor.web3.SystemProgram.programId }).rpc();
+            settle.opened = (settle.opened || 0) + 1;
+          } catch (e) { settle.lastError = `open_pot cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
+        }
+      }
+    }
     settle.lastOk = Date.now();
   } catch (e) { settle.errors++; settle.lastError = String(e).slice(0, 140); console.log("settle: sweep error " + settle.lastError); }
 }
@@ -156,12 +177,22 @@ async function chainSubmit(creditIdB58, body, result) {
   try { credit = await program.account.credit.fetch(creditPk); }
   catch (e) { return { ok: false, code: 410, reason: "credit not found (unpaid, or already scored)" }; }
 
-  // The chain's commitment is the truth; the client's copy is ignored.
-  const seedBuf = Buffer.alloc(4);
-  seedBuf.writeInt32LE(body.seed | 0);
-  const commit = crypto.createHash("sha256").update(seedBuf).digest();
+  // The credit's cabinet decides the game. A replay from a higher-scoring
+  // engine must not be able to land in another cabinet's pot.
+  let cabGame = chain.cabinetGame.get(credit.cabinetId);
+  if (!cabGame) {
+    try {
+      const cab = await program.account.cabinet.fetch(chain.cabinetPda(credit.cabinetId));
+      cabGame = Buffer.from(cab.game).toString("utf8").replace(/\0+$/, "");
+      chain.cabinetGame.set(credit.cabinetId, cabGame);
+    } catch (e) { return { ok: false, code: 502, reason: "cabinet lookup failed" }; }
+  }
+  if (cabGame !== body.game) return { ok: false, code: 422, reason: `credit is for ${cabGame}, not ${body.game}` };
+
+  // The chain's commitment is the truth: sha256(secret) must equal it.
+  const commit = crypto.createHash("sha256").update(Buffer.from(body.secret, "hex")).digest();
   if (!commit.equals(Buffer.from(credit.seedCommit))) {
-    return { ok: false, code: 422, reason: "seed does not match on-chain commitment" };
+    return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
   }
 
   // The published replay hash: sha256 over the canonical replay record.
@@ -218,17 +249,31 @@ function verifyRun(body) {
   }
   const Engine = GAMES[game];
   if (!Engine) return { ok: false, reason: "unknown game" };
-  if (!Array.isArray(inputsRLE) || inputsRLE.length > 400_000) {
+  if (!Array.isArray(inputsRLE) || inputsRLE.length > 400_000 || inputsRLE.length % 2 !== 0) {
     return { ok: false, reason: "bad input log" };
   }
-
-  // Seed must match its pre-play commitment: sha256(le32(seed)).
-  const seedBuf = Buffer.alloc(4);
-  seedBuf.writeInt32LE(seed | 0);
-  const commit = crypto.createHash("sha256").update(seedBuf).digest("hex");
-  if (seedCommit && commit !== seedCommit) {
-    return { ok: false, reason: "seed does not match commitment" };
+  // Validate the RLE before expanding it: a two-element body could otherwise
+  // ask for a 500 MB array. Masks are non-negative ints (pointer games pack
+  // mouse coords in), run lengths are 1..MAX_TICKS, total ticks bounded.
+  const MAXT = Engine.MAX_TICKS + 1000;
+  let total = 0;
+  for (let i = 0; i < inputsRLE.length; i += 2) {
+    const m = inputsRLE[i], n = inputsRLE[i + 1];
+    if (!Number.isInteger(m) || m < 0 || m > 0x3fffffff) return { ok: false, reason: "bad input mask" };
+    if (!Number.isInteger(n) || n < 1 || n > MAXT) return { ok: false, reason: "bad run length" };
+    total += n;
+    if (total > MAXT) return { ok: false, reason: "log too long" };
   }
+
+  // The run's secret (32 bytes, hex) proves ownership of the credit: its
+  // sha256 is the on-chain commitment, and the engine seed is the first four
+  // bytes of that commitment. Nobody else can submit a run for this credit.
+  const secret = body.secret;
+  if (typeof secret !== "string" || !/^[0-9a-f]{64}$/i.test(secret)) return { ok: false, reason: "bad secret" };
+  const commitBuf = crypto.createHash("sha256").update(Buffer.from(secret, "hex")).digest();
+  const derivedSeed = commitBuf.readInt32LE(0);
+  if ((seed | 0) !== derivedSeed) return { ok: false, reason: "seed does not derive from secret" };
+  const commit = commitBuf.toString("hex");
 
   const masks = Engine.decodeRLE(inputsRLE);
   if (masks.length > Engine.MAX_TICKS + 1000) return { ok: false, reason: "log too long" };
@@ -255,7 +300,7 @@ function signVerdict(v) {
 }
 
 const server = http.createServer((req, res) => {
-  const send = (code, obj) => {
+  let send = (code, obj) => {
     res.writeHead(code, { "content-type": "application/json", "access-control-allow-origin": "*" });
     res.end(JSON.stringify(obj));
   };
@@ -273,6 +318,7 @@ const server = http.createServer((req, res) => {
   // Current pot standings + bounty for a cabinet, straight off the chain.
   if (req.method === "GET" && req.url === "/leaderboards") {
     if (!chain) return send(503, { error: "chain mode off" });
+    if (readCache.lb && Date.now() - readCache.lb.at < 8000) return send(200, readCache.lb.body);
     (async () => {
       const { program, potPda } = chain;
       const arcade = await program.account.arcade.fetch(chain.arcadePda);
@@ -291,7 +337,8 @@ const server = http.createServer((req, res) => {
         } catch (e) { /* no pot */ }
       }));
       boards.sort((a, b) => b.potLamports - a.potLamports);
-      send(200, { day, periodSeconds: period, boards });
+      readCache.lb = { at: Date.now(), body: { day, periodSeconds: period, boards } };
+      send(200, readCache.lb.body);
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
   }
@@ -385,6 +432,7 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     return send(200, {
       ok: true,
+      uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
       settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, pending: settle.pending, errors: settle.errors, lastError: settle.lastError } : "off",
       games: Object.keys(GAMES).length,
       engines: ENGINE_HASH,
@@ -402,15 +450,32 @@ const server = http.createServer((req, res) => {
   }
 
   if (req.method === "POST" && req.url === "/submit") {
+    // Abuse limits: a full 10-minute run RLE-encodes to a few KB, so 1 MB is
+    // generous; 30 submits/minute/IP is far above any human; one in-flight
+    // verification per credit so two racing submits can't double-hit the chain.
+    // Fly sets fly-client-ip; never trust a client-supplied x-forwarded-for.
+    // Behind Fly, fly-client-ip is authoritative. Anywhere else, only the
+    // socket address counts — x-forwarded-for is attacker-controlled text.
+    const ip = (req.headers["fly-client-ip"] || req.socket.remoteAddress || "?").toString();
+    const now = Date.now();
+    const hits = (submitHits.get(ip) || []).filter((t) => now - t < 60_000);
+    if (hits.length >= 30) return send(429, { verified: false, reason: "too many submits; slow down" });
+    hits.push(now); submitHits.set(ip, hits);
     let body = "";
     req.on("data", (c) => {
       body += c;
-      if (body.length > 5_000_000) req.destroy();
+      if (body.length > 1_000_000) { send(413, { verified: false, reason: "body too large" }); req.destroy(); }
     });
     req.on("end", () => {
       let parsed;
       try { parsed = JSON.parse(body); }
       catch { return send(400, { error: "bad json" }); }
+      if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return send(400, { error: "bad body" });
+      if (typeof parsed.creditId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(parsed.creditId)) return send(422, { verified: false, reason: "bad creditId" });
+      if (inFlight.has(parsed.creditId)) return send(409, { verified: false, reason: "that credit is already being verified" });
+      inFlight.add(parsed.creditId);
+      const _send = send; send = (code, obj) => { inFlight.delete(parsed.creditId); return _send(code, obj); };
+      try {
       const result = verifyRun(parsed);
       if (!result.ok) return send(422, { verified: false, reason: result.reason });
 
@@ -428,7 +493,8 @@ const server = http.createServer((req, res) => {
       // The receipt: everything anyone needs to re-run the verification.
       fs.writeFileSync(
         path.join(RECEIPTS_DIR, `${parsed.creditId}.json`),
-        JSON.stringify({ ...parsed, engineHash: ENGINE_HASH[parsed.game], verdict, onchain }, null, 1)
+        JSON.stringify({ creditId: parsed.creditId, game: parsed.game, seed: parsed.seed, secret: parsed.secret, inputsRLE: parsed.inputsRLE,
+          claimedScore: parsed.claimedScore, claimedHash: parsed.claimedHash, engineHash: ENGINE_HASH[parsed.game], verdict, onchain }, null, 1)
       );
       return send(200, { verified: true, verdict, onchain, signed: signVerdict(verdict), tas: result.tas });
       };
@@ -442,6 +508,10 @@ const server = http.createServer((req, res) => {
           .catch((e) => send(502, { verified: false, reason: "chain submit failed: " + String(e).slice(0, 200) }));
       } else {
         finish(null);
+      }
+      } catch (e) {
+        console.log("submit handler error: " + String(e).slice(0, 200));
+        return send(500, { verified: false, reason: "verifier error" });
       }
     });
     return;

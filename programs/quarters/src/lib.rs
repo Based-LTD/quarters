@@ -6,6 +6,9 @@
 use anchor_lang::prelude::*;
 use anchor_lang::system_program::{transfer, Transfer};
 
+pub const SUBMIT_WINDOW: i64 = 1200;   // seconds from insert_coin to submit_score
+pub const SETTLE_GRACE: i64 = 900;     // seconds after a period before settle_pot (capped at period/4)
+
 declare_id!("GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a");
 
 pub const TOP_N: usize = 10;
@@ -90,13 +93,10 @@ pub mod quarters {
     }
 
     pub fn insert_coin(ctx: Context<InsertCoin>, seed_commit: [u8; 32]) -> Result<()> {
-        let quarter = match &ctx.accounts.stakes {
-            Some(st) => {
-                require!(st.cabinet_id == ctx.accounts.cabinet.id, QuartersError::WrongWinnerAccounts);
-                st.price
-            }
-            None => ctx.accounts.arcade.quarter_lamports,
-        };
+        // Every cabinet has a Stakes account (its price). No optional path:
+        // a client cannot pay the floor price into a back-room pot.
+        require!(ctx.accounts.stakes.cabinet_id == ctx.accounts.cabinet.id, QuartersError::WrongWinnerAccounts);
+        let quarter = ctx.accounts.stakes.price;
         let pot_cut = quarter * ctx.accounts.arcade.pot_bps as u64 / 10_000;
         let op_cut = quarter * ctx.accounts.arcade.operator_bps as u64 / 10_000;
         let house_cut = quarter - pot_cut - op_cut;
@@ -160,6 +160,7 @@ pub mod quarters {
         cr.index = ctx.accounts.arcade.credit_counter;
         cr.bump = ctx.bumps.credit;
         cr.rent_payer = ctx.accounts.player.key();
+        cr.inserted_at = Clock::get()?.unix_timestamp;
         ctx.accounts.arcade.credit_counter += 1;
 
         emit!(CoinInserted {
@@ -224,13 +225,10 @@ pub mod quarters {
             QuartersError::WrongTreasury
         );
 
-        let quarter = match &ctx.accounts.stakes {
-            Some(st) => {
-                require!(st.cabinet_id == ctx.accounts.cabinet.id, QuartersError::WrongWinnerAccounts);
-                st.price
-            }
-            None => ctx.accounts.arcade.quarter_lamports,
-        };
+        // Every cabinet has a Stakes account (its price). No optional path:
+        // a client cannot pay the floor price into a back-room pot.
+        require!(ctx.accounts.stakes.cabinet_id == ctx.accounts.cabinet.id, QuartersError::WrongWinnerAccounts);
+        let quarter = ctx.accounts.stakes.price;
         let pot_cut = quarter * ctx.accounts.arcade.pot_bps as u64 / 10_000;
         let op_cut = quarter * ctx.accounts.arcade.operator_bps as u64 / 10_000;
         let house_cut = quarter - pot_cut - op_cut;
@@ -280,6 +278,7 @@ pub mod quarters {
         cr.index = ctx.accounts.arcade.credit_counter;
         cr.bump = ctx.bumps.credit;
         cr.rent_payer = signer;
+        cr.inserted_at = Clock::get()?.unix_timestamp;
         ctx.accounts.arcade.credit_counter += 1;
 
         emit!(CoinInserted {
@@ -302,6 +301,9 @@ pub mod quarters {
     pub fn submit_score(ctx: Context<SubmitScore>, score: u32, replay_hash: [u8; 32]) -> Result<()> {
         let credit = &mut ctx.accounts.credit;
         require!(!credit.consumed, QuartersError::CreditConsumed);
+        // A run must be verified within SUBMIT_WINDOW of paying: a max-length
+        // run is 10 minutes, so a tool-assisted replay has to be produced live.
+        require!(Clock::get()?.unix_timestamp <= credit.inserted_at + SUBMIT_WINDOW, QuartersError::SubmitWindow);
         credit.consumed = true;
 
         let pot = &mut ctx.accounts.pot;
@@ -351,6 +353,9 @@ pub mod quarters {
     pub fn claim_bounty(ctx: Context<ClaimBounty>, score: u32, replay_hash: [u8; 32]) -> Result<()> {
         let credit = &mut ctx.accounts.credit;
         require!(!credit.consumed, QuartersError::CreditConsumed);
+        // A run must be verified within SUBMIT_WINDOW of paying: a max-length
+        // run is 10 minutes, so a tool-assisted replay has to be produced live.
+        require!(Clock::get()?.unix_timestamp <= credit.inserted_at + SUBMIT_WINDOW, QuartersError::SubmitWindow);
         credit.consumed = true;
 
         let bounty = &mut ctx.accounts.bounty;
@@ -401,7 +406,12 @@ pub mod quarters {
         let now_day = (Clock::get()?.unix_timestamp / ctx.accounts.arcade.period_seconds as i64) as u32;
         let pot = &mut ctx.accounts.pot;
         require!(!pot.settled, QuartersError::PotSettled);
+        // Grace after the period ends so runs started at the buzzer can still
+        // land (a run is up to 10 minutes; verifier latency on top).
+        let period = ctx.accounts.arcade.period_seconds as i64;
+        let grace = core::cmp::min(SETTLE_GRACE, period / 4);
         require!(now_day > pot.day, QuartersError::DayNotOver);
+        require!(Clock::get()?.unix_timestamp >= (pot.day as i64 + 1) * period + grace, QuartersError::DayNotOver);
         pot.settled = true;
 
         let rent = Rent::get()?.minimum_balance(8 + DailyPot::INIT_SPACE);
@@ -472,6 +482,22 @@ pub mod quarters {
         st.bump = ctx.bumps.stakes;
         Ok(())
     }
+
+    // Pre-create a cabinet's pot for a period so the first player of the day
+    // doesn't pay its rent. Anyone may call it; the settle daemon does.
+    pub fn open_pot(ctx: Context<OpenPot>, day: u32) -> Result<()> {
+        let now_day = (Clock::get()?.unix_timestamp / ctx.accounts.arcade.period_seconds as i64) as u32;
+        require!(day >= now_day && day <= now_day + 2, QuartersError::WrongDay);
+        let pd = &mut ctx.accounts.pot;
+        if !pd.initialized {
+            pd.initialized = true;
+            pd.cabinet_id = ctx.accounts.cabinet.id;
+            pd.day = day;
+            pd.count = 0;
+            pd.settled = false;
+        }
+        Ok(())
+    }
 }
 
 // ---------- state ----------
@@ -538,6 +564,7 @@ pub struct Credit {
     pub index: u64,
     pub bump: u8,
     pub rent_payer: Pubkey,
+    pub inserted_at: i64,
 }
 
 #[account]
@@ -593,6 +620,7 @@ pub struct SetOperator<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(seed_commit: [u8; 32])]
 pub struct InsertCoin<'info> {
     #[account(mut, seeds = [b"arcade"], bump = arcade.bump)]
     pub arcade: Account<'info, Arcade>,
@@ -622,7 +650,7 @@ pub struct InsertCoin<'info> {
         init,
         payer = player,
         space = 8 + Credit::INIT_SPACE,
-        seeds = [b"credit".as_ref(), player.key().as_ref(), &arcade.credit_counter.to_le_bytes()],
+        seeds = [b"credit".as_ref(), player.key().as_ref(), &seed_commit],
         bump
     )]
     pub credit: Account<'info, Credit>,
@@ -635,7 +663,8 @@ pub struct InsertCoin<'info> {
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
-    pub stakes: Option<Account<'info, Stakes>>,
+    #[account(seeds = [b"stakes".as_ref(), &[cabinet.id]], bump = stakes.bump)]
+    pub stakes: Account<'info, Stakes>,
 }
 
 #[derive(Accounts)]
@@ -647,7 +676,7 @@ pub struct SubmitScore<'info> {
     #[account(
         mut,
         close = rent_payer,
-        seeds = [b"credit".as_ref(), credit.player.as_ref(), &credit.index.to_le_bytes()],
+        seeds = [b"credit".as_ref(), credit.player.as_ref(), &credit.seed_commit],
         bump = credit.bump
     )]
     pub credit: Account<'info, Credit>,
@@ -678,7 +707,7 @@ pub struct ClaimBounty<'info> {
     #[account(
         mut,
         close = rent_payer,
-        seeds = [b"credit".as_ref(), credit.player.as_ref(), &credit.index.to_le_bytes()],
+        seeds = [b"credit".as_ref(), credit.player.as_ref(), &credit.seed_commit],
         bump = credit.bump
     )]
     pub credit: Account<'info, Credit>,
@@ -726,6 +755,7 @@ pub struct OpenTab<'info> {
 }
 
 #[derive(Accounts)]
+#[instruction(seed_commit: [u8; 32])]
 pub struct StartRun<'info> {
     #[account(mut, seeds = [b"arcade"], bump = arcade.bump)]
     pub arcade: Account<'info, Arcade>,
@@ -757,7 +787,7 @@ pub struct StartRun<'info> {
         init,
         payer = signer,
         space = 8 + Credit::INIT_SPACE,
-        seeds = [b"credit".as_ref(), tab.player.as_ref(), &arcade.credit_counter.to_le_bytes()],
+        seeds = [b"credit".as_ref(), tab.player.as_ref(), &seed_commit],
         bump
     )]
     pub credit: Account<'info, Credit>,
@@ -770,7 +800,8 @@ pub struct StartRun<'info> {
     #[account(mut)]
     pub treasury: UncheckedAccount<'info>,
     pub system_program: Program<'info, System>,
-    pub stakes: Option<Account<'info, Stakes>>,
+    #[account(seeds = [b"stakes".as_ref(), &[cabinet.id]], bump = stakes.bump)]
+    pub stakes: Account<'info, Stakes>,
 }
 
 #[derive(Accounts)]
@@ -849,6 +880,8 @@ pub enum QuartersError {
     WrongPlayer,
     #[msg("day not over yet")]
     DayNotOver,
+    #[msg("credit's submit window has passed")]
+    SubmitWindow,
     #[msg("winner accounts do not match leaderboard")]
     WrongWinnerAccounts,
     #[msg("signer is neither the tab's session key nor its owner")]
@@ -881,4 +914,24 @@ pub struct Stakes {
     pub cabinet_id: u8,
     pub price: u64,
     pub bump: u8,
+}
+
+#[derive(Accounts)]
+#[instruction(day: u32)]
+pub struct OpenPot<'info> {
+    #[account(seeds = [b"arcade"], bump = arcade.bump)]
+    pub arcade: Account<'info, Arcade>,
+    #[account(seeds = [b"cabinet".as_ref(), &[cabinet.id]], bump = cabinet.bump)]
+    pub cabinet: Account<'info, Cabinet>,
+    #[account(
+        init_if_needed,
+        payer = payer,
+        space = 8 + DailyPot::INIT_SPACE,
+        seeds = [b"pot".as_ref(), &[cabinet.id], &day.to_le_bytes()],
+        bump
+    )]
+    pub pot: Account<'info, DailyPot>,
+    #[account(mut)]
+    pub payer: Signer<'info>,
+    pub system_program: Program<'info, System>,
 }

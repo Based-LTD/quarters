@@ -4,6 +4,7 @@
 // the tab exactly; rent refunds cycle back to the session key; unauthorized
 // keys and empty tabs are rejected; close_tab refunds every unused lamport.
 const anchor = require("@coral-xyz/anchor");
+const crypto = require("crypto");
 const fs = require("fs");
 const os = require("os");
 const path = require("path");
@@ -46,11 +47,13 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     d.writeUInt32LE(day);
     return PublicKey.findProgramAddressSync([Buffer.from("pot"), Buffer.from([1]), d], PID)[0];
   };
-  const creditPda = (index) => {
-    const ib = Buffer.alloc(8);
-    ib.writeBigUInt64LE(BigInt(index));
-    return PublicKey.findProgramAddressSync([Buffer.from("credit"), payerKp.publicKey.toBuffer(), ib], PID)[0];
-  };
+
+  // --- v3 credit protocol: secret → commit → credit PDA; every cabinet has a Stakes account ---
+  const stakesPdaOf = (id) => PublicKey.findProgramAddressSync([Buffer.from("stakes"), Buffer.from([id])], PID)[0];
+  const mkSecret = (tag) => { const b = Buffer.alloc(32); b.writeUInt32LE((Date.now() ^ (tag * 2654435761)) >>> 0, 0); b[4] = tag & 255; return b; };
+  const commitOf = (secret) => crypto.createHash("sha256").update(secret).digest();
+  const creditPdaOf = (player, commit) => PublicKey.findProgramAddressSync([Buffer.from("credit"), player.toBuffer(), commit], PID)[0];
+
 
   // Fund the session key's fee float and the stranger (one wallet tx IRL).
   {
@@ -83,13 +86,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   const pot = potPda(day);
 
   async function startRun(signerKp, commitByte) {
-    const a = await program.account.arcade.fetch(arcadePda);
-    const credit = creditPda(a.creditCounter.toNumber());
+    const secret = mkSecret(commitByte);
+    const commit = commitOf(secret);
+    const credit = creditPdaOf(payerKp.publicKey, commit);
     await program.methods
-      .startRun(Array(32).fill(commitByte))
+      .startRun(Array.from(commit))
       .accounts({
         arcade: arcadePda,
-        cabinet: cabinetPda, stakes: null,
+        cabinet: cabinetPda, stakes: stakesPdaOf(1),
         tab: tabPda,
         pot: potPda(Math.floor(Date.now() / 1000 / PERIOD)),
         bounty: bountyPda,
