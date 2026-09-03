@@ -10,6 +10,7 @@
 // score reproduces. No network trust required.
 const fs = require("fs");
 const path = require("path");
+const crypto = require("crypto");
 
 async function load(arg) {
   if (/^https?:\/\//.test(arg)) { const r = await fetch(arg); if (!r.ok) throw new Error("HTTP " + r.status); return r.json(); }
@@ -21,7 +22,13 @@ async function load(arg) {
   if (!arg) { console.error("usage: node tools/replay.js <receipt url or file>"); process.exit(2); }
   const rc = await load(arg);
   const game = rc.game;
-  const Engine = require(path.join(__dirname, "..", "engine", game + ".js"));
+  const enginePath = path.join(__dirname, "..", "engine", game + ".js");
+  const Engine = require(enginePath);
+  const localHash = crypto.createHash("sha256").update(fs.readFileSync(enginePath)).digest("hex").slice(0, 16);
+  if (rc.engineHash && rc.engineHash !== localHash) {
+    console.log(`engine     LOCAL ${localHash} ≠ RECEIPT ${rc.engineHash}`);
+    console.log("           this receipt was produced by a different engine version; check out the matching commit to reproduce it.\n");
+  } else if (rc.engineHash) console.log(`engine     ${localHash} (matches receipt)`);
   const masks = Engine.decodeRLE(rc.inputsRLE);
   const s = Engine.createState(rc.seed | 0);
   for (const m of masks) { if (s.gameOver) break; Engine.tick(s, m); }

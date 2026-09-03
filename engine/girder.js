@@ -10,25 +10,34 @@ const Girder = (() => {
 
   // Girders: [x0, y0, x1, y1] px, alternating slopes like a fire-escape.
   // Kegs roll toward the LOW end and drop to the girder below.
-  const GIRDERS = [
-    [0, 648, 960, 632],     // 0 floor — low at left (kegs exit left)
-    [60, 564, 900, 580],    // 1 — low at right
-    [60, 484, 900, 468],    // 2 — low at left
-    [60, 380, 900, 396],    // 3 — low at right
-    [60, 300, 900, 284],    // 4 — low at left
-    [60, 196, 900, 212],    // 5 — low at right (kegs spawn left, by the RIGGER)
+  // Kegs roll toward the LOW end and drop to the girder below.
+  // Girders: [x0, y0, x1, y1]. Three sites cycle by level: the classic zigzag,
+  // its mirror (RIGGER on the right, ladders elsewhere), and a tight site
+  // with an extra ladder run and one more wrench.
+  const LAYOUTS = [
+    { GIRDERS: [
+        [0, 648, 960, 632], [60, 564, 900, 580], [60, 484, 900, 468],
+        [60, 380, 900, 396], [60, 300, 900, 284], [60, 196, 900, 212] ],
+      TOP: { x0: 60, x1: 300, y: 150 },
+      LADDERS: [[780, 0], [300, 0], [120, 1], [620, 1], [840, 2], [400, 2], [160, 3], [700, 3], [860, 4], [260, 4], [90, 5]],
+      WRENCHES: [[2, 500], [4, 420]], SPAWN_X: 100, START_X: 120 },
+    { GIRDERS: [
+        [0, 632, 960, 648], [60, 580, 900, 564], [60, 468, 900, 484],
+        [60, 396, 900, 380], [60, 284, 900, 300], [60, 212, 900, 196] ],
+      TOP: { x0: 660, x1: 900, y: 150 },
+      LADDERS: [[180, 0], [660, 0], [840, 1], [340, 1], [120, 2], [560, 2], [800, 3], [260, 3], [100, 4], [700, 4], [870, 5]],
+      WRENCHES: [[1, 460], [3, 520]], SPAWN_X: 860, START_X: 840 },
+    { GIRDERS: [
+        [0, 648, 960, 632], [60, 564, 900, 580], [60, 484, 900, 468],
+        [60, 380, 900, 396], [60, 300, 900, 284], [60, 196, 900, 212] ],
+      TOP: { x0: 60, x1: 300, y: 150 },
+      LADDERS: [[860, 0], [480, 0], [140, 1], [700, 1], [820, 2], [300, 2], [180, 3], [600, 3], [880, 4], [380, 4], [90, 5]],
+      WRENCHES: [[1, 300], [3, 700], [5, 500]], SPAWN_X: 100, START_X: 120 },
   ];
-  const TOP = { x0: 60, x1: 300, y: 150 };   // platform with the RIGGER + Coin
-  // Ladders: [x, lowerGirder] — connects lowerGirder to the one above.
-  const LADDERS = [
-    [780, 0], [300, 0],
-    [120, 1], [620, 1],
-    [840, 2], [400, 2],
-    [160, 3], [700, 3],
-    [860, 4], [260, 4],
-    [90, 5],                 // final ladder to the platform
-  ];
-  const WRENCHES = [[2, 500], [4, 420]];     // [girder, x] per level
+  const layoutOf = (s) => LAYOUTS[(s.level - 1) % LAYOUTS.length];
+  // Live views of the current level's site (set by levelStart).
+  let GIRDERS = LAYOUTS[0].GIRDERS, TOP = LAYOUTS[0].TOP, LADDERS = LAYOUTS[0].LADDERS, WRENCHES = LAYOUTS[0].WRENCHES, SPAWN_X = 100, START_X = 120;
+  function useLayout(s) { const L = layoutOf(s); GIRDERS = L.GIRDERS; TOP = L.TOP; LADDERS = L.LADDERS; WRENCHES = L.WRENCHES; SPAWN_X = L.SPAWN_X; START_X = L.START_X; }
 
   const RUN = 460;            // fp px/tick
   const CLIMB = 320;
@@ -70,9 +79,10 @@ const Girder = (() => {
   }
 
   function resetPlayer(s) {
-    s.px = 120 << FP;
+    useLayout(s);
+    s.px = START_X << FP;
     s.pg = 0;                  // girder index; -1 = on ladder, -2 = airborne
-    s.py = girderY(0, 120) << FP;
+    s.py = girderY(0, START_X) << FP;
     s.pvy = 0;
     s.ladder = -1;
     s.climbing = 0;
@@ -82,6 +92,7 @@ const Girder = (() => {
   }
 
   function levelStart(s) {
+    useLayout(s);
     s.kegs = [];
     s.spawnCd = 60;
     s.levelTick = 0;
@@ -116,6 +127,7 @@ const Girder = (() => {
 
   function tick(s, input) {
     if (s.gameOver) return;
+    useLayout(s);
     s.events = [];
     s.tick++;
     s.levelTick++;
@@ -233,7 +245,7 @@ const Girder = (() => {
     // ---- RIGGER spawns kegs onto girder 5's high (left) end ----
     if (--s.spawnCd <= 0) {
       s.spawnCd = spawnGap(s) + rnd(s, 30);
-      s.kegs.push({ x: 100 << FP, y: (girderY(5, 100) - 10) << FP, g: 5, vy: 0, onLadder: -1, ly: 0, scored: 0 });
+      s.kegs.push({ x: SPAWN_X << FP, y: (girderY(5, SPAWN_X) - 10) << FP, g: 5, vy: 0, onLadder: -1, ly: 0, scored: 0 });
       s.events.push({ t: "keg" });
     }
 
@@ -345,7 +357,7 @@ const Girder = (() => {
 
   return {
     createState, tick, stateHash, runHeadless, encodeRLE, decodeRLE,
-    GIRDERS, TOP, LADDERS, girderY, W, H, FP, MAX_TICKS,
+    GIRDERS, TOP, LADDERS, LAYOUTS, layoutOf, girderY, W, H, FP, MAX_TICKS,
   };
 })();
 if (typeof module !== "undefined") module.exports = Girder;

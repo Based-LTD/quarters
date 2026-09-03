@@ -7,7 +7,7 @@
 const Stack = (() => {
   const COLS = 13, ROWS = 20;
   const START_W = 4;
-  const NARROW_AT = { 5: 3, 10: 2, 15: 1 };   // rows where max width shrinks
+  const NARROW_AT = { 7: 3, 13: 2, 18: 1 };   // rows where max width shrinks
   const JACKPOT = 2000, PERFECT = 25;
   const ROW_LIMIT = 900;                       // 15s per row, then auto-drop
   const MAX_TICKS = 36000;
@@ -21,7 +21,7 @@ const Stack = (() => {
   function rnd(s, n) { return mulberry(s) % n; }
 
   function moveEvery(s) {
-    return Math.max(2, 9 - (s.row >> 1) - (s.level - 1));
+    return Math.max(3, 11 - Math.trunc(s.row / 3) - (s.level - 1));
   }
 
   function newRow(s) {

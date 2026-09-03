@@ -190,8 +190,9 @@ const Chomp = (() => {
       if (s.fright === 0) { s.chain = 0; s.events.push({ t: "fright-end" }); }
     }
 
-    // Player: moves only while a direction is held — release to stop.
-    const holding = (input & 15) !== 0;
+    // Player keeps moving in the current direction (classic); a buffered
+    // turn applies at the next tile where it's open, so presses never get lost.
+    const holding = true;
     const pe = { x: s.px, y: s.py, dir: s.pdir };
     if (aligned(pe)) {
       const t = tileOf(pe);

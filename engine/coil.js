@@ -30,7 +30,7 @@ const Coil = (() => {
     const s = {
       rs: seed | 0,
       tick: 0, score: 0, apples: 0, speed: 0,
-      dir: 1, pendingDir: 1,
+      dir: 1, pendingDir: 1, pendingDir2: -1,
       moveCd: MOVE_START, grow: 0,
       snake: [],                            // head first, {x,y} cells
       apple: { x: 0, y: 0 },
@@ -88,7 +88,12 @@ const Coil = (() => {
     else if (input & 2) req = 1;
     else if (input & 4) req = 2;
     else if (input & 8) req = 3;
-    if (req >= 0 && req !== OPP[s.dir]) s.pendingDir = req;
+    if (req >= 0) {
+      if (req !== s.pendingDir && req !== OPP[s.pendingDir]) {
+        if (s.pendingDir === s.dir) { if (req !== OPP[s.dir]) s.pendingDir = req; }
+        else if (s.pendingDir2 !== req) s.pendingDir2 = req;
+      }
+    }
 
     if (s.coin) {
       s.coin.ttl--;
@@ -105,6 +110,8 @@ const Coil = (() => {
     s.moveCd = Math.max(MOVE_MIN, MOVE_START - s.speed);
 
     s.dir = s.pendingDir;
+    if (s.pendingDir2 >= 0 && s.pendingDir2 !== OPP[s.dir]) { s.pendingDir = s.pendingDir2; }
+    s.pendingDir2 = -1;
     const head = s.snake[0];
     const nx = head.x + DX[s.dir], ny = head.y + DY[s.dir];
 
@@ -148,7 +155,7 @@ const Coil = (() => {
       h = Math.imul(h, 16777619) >>> 0;
     };
     mix(s.tick); mix(s.score); mix(s.apples); mix(s.speed);
-    mix(s.dir); mix(s.pendingDir); mix(s.moveCd); mix(s.grow);
+    mix(s.dir); mix(s.pendingDir); mix(s.pendingDir2); mix(s.moveCd); mix(s.grow);
     mix(s.rs); mix(s.gameOver); mix(s.coinTimer);
     mix(s.apple.x); mix(s.apple.y);
     if (s.coin) { mix(s.coin.x); mix(s.coin.y); mix(s.coin.ttl); }

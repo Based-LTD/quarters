@@ -44,6 +44,12 @@ const GAMES = {
   summit: require(path.join(__dirname, "..", "engine", "summit.js")),
 };
 
+// Engine version stamps: sha256 of each engine file, so a receipt names the
+// exact code that produced it. Tuning an engine never silently invalidates
+// old receipts — the replay tool checks out the matching version instead.
+const ENGINE_HASH = Object.fromEntries(Object.keys(GAMES).map((g) => [g,
+  crypto.createHash("sha256").update(fs.readFileSync(path.join(__dirname, "..", "engine", g + ".js"))).digest("hex").slice(0, 16)]));
+
 const RECEIPTS_DIR = process.env.RECEIPTS_DIR || path.join(__dirname, "receipts");
 const KEY_FILE = process.env.VERIFIER_KEY_FILE || path.join(__dirname, "verifier-key.json");
 const REVIEW_SCORE = 0x7fffffff; // v1: no auto-payout gate on-chain yet
@@ -93,6 +99,54 @@ if (process.env.DEVNET_SUBMIT === "1") {
   const arcadePda = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID)[0];
   chain = { anchor, program, kp, conn, potPda, arcadePda };
   console.log("devnet submit mode: verifier", kp.publicKey.toBase58(), "program", PID.toBase58());
+}
+
+// ---- settle daemon: pay every finished pot, permissionlessly, on a timer ----
+// Scans cabinets 1..MAX_CAB for the last SETTLE_LOOKBACK periods; any pot that
+// exists, is unsettled, and whose period is over gets settle_pot with the
+// stored entries as remaining accounts. Idempotent: settled pots are skipped,
+// and the program rejects double-settles anyway.
+const settle = { enabled: process.env.SETTLE === "1", lastRun: null, lastOk: null, settled: 0, errors: 0, lastError: null, pending: 0 };
+async function settleSweep() {
+  if (!chain) return;
+  const { anchor, program, kp, conn, potPda, arcadePda } = chain;
+  const MAX_CAB = 31, LOOKBACK = parseInt(process.env.SETTLE_LOOKBACK || "7", 10);
+  settle.lastRun = Date.now();
+  try {
+    const arcade = await program.account.arcade.fetch(arcadePda);
+    const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
+    const nowDay = Math.floor(Date.now() / 1000 / period);
+    let pending = 0;
+    for (let cab = 1; cab <= MAX_CAB; cab++) {
+      for (let day = nowDay - LOOKBACK; day < nowDay; day++) {
+        const pk = potPda(cab, day);
+        let pot;
+        try { pot = await program.account.dailyPot.fetch(pk); } catch (e) { continue; }
+        if (!pot.initialized || pot.settled) continue;
+        pending++;
+        const winners = pot.entries.slice(0, pot.count).map((e) => ({ pubkey: e.player, isWritable: true, isSigner: false }));
+        try {
+          const sig = await program.methods.settlePot()
+            .accounts({ arcade: arcadePda, pot: pk, treasury: arcade.treasury })
+            .remainingAccounts(winners)
+            .rpc();
+          settle.settled++; pending--;
+          console.log(`settle: cabinet ${cab} day ${day} paid ${winners.length} winner(s) ${sig.slice(0, 12)}…`);
+        } catch (e) {
+          settle.errors++; settle.lastError = `cab ${cab} day ${day}: ${String(e).slice(0, 140)}`;
+          console.log("settle: FAILED " + settle.lastError);
+        }
+      }
+    }
+    settle.pending = pending;
+    settle.lastOk = Date.now();
+  } catch (e) { settle.errors++; settle.lastError = String(e).slice(0, 140); console.log("settle: sweep error " + settle.lastError); }
+}
+if (settle.enabled && chain) {
+  const every = Math.max(60, parseInt(process.env.SETTLE_INTERVAL_S || "300", 10)) * 1000;
+  console.log(`settle daemon on: every ${every / 1000}s, lookback ${process.env.SETTLE_LOOKBACK || 7} periods`);
+  setTimeout(settleSweep, 5000);
+  setInterval(settleSweep, every);
 }
 
 async function chainSubmit(creditIdB58, body, result) {
@@ -331,7 +385,9 @@ const server = http.createServer((req, res) => {
   if (req.method === "GET" && req.url === "/health") {
     return send(200, {
       ok: true,
+      settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, pending: settle.pending, errors: settle.errors, lastError: settle.lastError } : "off",
       games: Object.keys(GAMES).length,
+      engines: ENGINE_HASH,
       verifierPubkey: KEYS.publicKey.export({ format: "der", type: "spki" }).toString("base64"),
     });
   }
@@ -367,11 +423,12 @@ const server = http.createServer((req, res) => {
         ticks: result.ticks,
         tasFlagged: result.tas.flagged,
         verifiedAt: Date.now(),
+        engineHash: ENGINE_HASH[parsed.game],
       };
       // The receipt: everything anyone needs to re-run the verification.
       fs.writeFileSync(
         path.join(RECEIPTS_DIR, `${parsed.creditId}.json`),
-        JSON.stringify({ ...parsed, verdict, onchain }, null, 1)
+        JSON.stringify({ ...parsed, engineHash: ENGINE_HASH[parsed.game], verdict, onchain }, null, 1)
       );
       return send(200, { verified: true, verdict, onchain, signed: signVerdict(verdict), tas: result.tas });
       };

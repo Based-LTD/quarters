@@ -35,8 +35,8 @@ const Overrun = (() => {
 
   function spawnWave(s) {
     s.enemies = [];
-    const grunts = 8 + s.wave * 3;
-    const brutes = Math.min(6, s.wave - 1);
+    const grunts = 6 + s.wave * 2;
+    const brutes = Math.min(6, Math.max(0, s.wave - 2));
     for (let i = 0; i < grunts; i++) {
       const p = edgePoint(s);
       s.enemies.push({ x: p.x << FP, y: p.y << FP, type: 0, hp: 1, cd: rnd(s, 30) });
@@ -170,7 +170,7 @@ const Overrun = (() => {
     // Enemies converge (grunts every tick, brutes every other)
     for (const e of s.enemies) {
       if (e.type === 1 && (s.tick & 1)) continue;
-      const spd = e.type === 1 ? 200 : 260 + Math.min(140, s.wave * 20);
+      const spd = e.type === 1 ? 190 : 230 + Math.min(150, s.wave * 15);
       e.x += e.x < s.px ? spd : -spd;
       e.y += e.y < s.py ? spd : -spd;
       if (s.dead === 0 && s.invuln === 0) {

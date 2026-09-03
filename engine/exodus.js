@@ -170,7 +170,12 @@ const Exodus = (() => {
       return;
     }
 
-    if (m.st === BLOCK) return;
+    if (m.st === BLOCK) {
+      // A blocker holds until the ground under it is removed — dig or bash
+      // beneath it and it drops back into the crowd (as in the original).
+      if (!solid(s, col, row)) { m.st = FALL; m.fs = py; }
+      return;
+    }
 
     if (m.st === BUILD) {
       if (--m.t > 0) return;
@@ -330,7 +335,8 @@ const Exodus = (() => {
         const cx = s.cx >> FP, cy = s.cy >> FP;
         let best = null, bd = 48 * 48;
         for (const m of s.marchers) {
-          if (m.st !== WALK) continue;
+          // walkers, or blockers being reassigned to any other job
+          if (!(m.st === WALK || (m.st === BLOCK && s.jobSel !== 0))) continue;
           const dx = (m.x >> FP) - cx, dy = (m.y >> FP) - 8 - cy;
           const d = dx * dx + dy * dy;
           if (d < bd) { bd = d; best = m; }
