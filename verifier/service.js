@@ -473,6 +473,11 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  // Liveness for the platform's router: 200 whenever the process can answer.
+  // /health carries the money sensors and may return 503 (red) — never point
+  // a router's health check at it, or a red sensor takes the service offline.
+  if (req.method === "GET" && req.url === "/live") return send(200, { ok: true, uptimeS: Math.round((Date.now() - STARTED_AT) / 1000) });
+
   if (req.method === "GET" && req.url === "/health") {
     // Sensors: each green/yellow/red; overall = worst; 503 on red so any dumb
     // monitor can page on status code alone.
