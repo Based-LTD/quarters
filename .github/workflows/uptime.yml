@@ -1,0 +1,29 @@
+name: uptime
+# Free watchdog: every 15 minutes, hit the verifier's /health. If it's down,
+# the settle daemon has errors, or the last settle sweep is stale, this job
+# fails and GitHub emails the repo owners.
+on:
+  schedule:
+    - cron: "*/15 * * * *"
+  workflow_dispatch:
+jobs:
+  health:
+    runs-on: ubuntu-latest
+    steps:
+      - name: verifier health
+        run: |
+          set -e
+          out=$(curl -sf --max-time 20 https://quarters-verifier.fly.dev/health) || { echo "verifier DOWN"; exit 1; }
+          echo "$out"
+          node -e '
+            const d = JSON.parse(process.argv[1]);
+            if (!d.ok) { console.log("health not ok"); process.exit(1); }
+            if (d.settle && d.settle !== "off") {
+              const age = Date.now() - (d.settle.lastOk || 0);
+              if (age > 30 * 60 * 1000) { console.log("settle sweep stale: " + Math.round(age/60000) + " min"); process.exit(1); }
+              if (d.settle.errors > 0 && d.settle.lastError) { console.log("settle errors: " + d.settle.lastError); process.exit(1); }
+            }
+            console.log("ok: games=" + d.games + " settled=" + (d.settle && d.settle.settled));
+          ' "$out"
+      - name: site up
+        run: curl -sf --max-time 20 -o /dev/null https://quarters.fun/ || { echo "site DOWN"; exit 1; }
