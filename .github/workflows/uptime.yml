@@ -22,9 +22,11 @@ jobs:
               const up = (d.uptimeS || 0) * 1000;
               const age = d.settle.lastOk ? Date.now() - d.settle.lastOk : up;
               if (up > 30 * 60 * 1000 && age > 30 * 60 * 1000) { console.log("settle sweep stale: " + Math.round(age/60000) + " min"); process.exit(1); }
-              if (d.settle.errors > 0 && d.settle.lastError) { console.log("settle errors: " + d.settle.lastError); process.exit(1); }
+              // rolling: only the last completed sweep counts (cumulative counters never clear)
+              if ((d.settle.lastSweepErrors || 0) > 0) { console.log("last sweep had errors: " + (d.settle.lastError || d.settle.lastOpenError)); process.exit(1); }
             }
-            if (d.signer && d.signer.lamports !== null && d.signer.lamports < 0.05e9) { console.log("verifier signer key low: " + (d.signer.lamports/1e9).toFixed(3) + " SOL — fund " + d.signer.pubkey); process.exit(1); }
+            // the signer is a flow-through key: it pre-pays ~0.162 SOL of pot rent per period (31 cabinets); red below one period of runway
+            if (d.signer && d.signer.lamports !== null && d.signer.lamports < 0.17e9) { console.log("verifier signer runway < 1 period: " + (d.signer.lamports/1e9).toFixed(3) + " SOL — fund " + d.signer.pubkey); process.exit(1); }
             console.log("ok: games=" + d.games + " settled=" + (d.settle && d.settle.settled) + " opened=" + (d.settle && d.settle.opened) + " signer=" + (d.signer && (d.signer.lamports/1e9).toFixed(3)));
           ' "$out"
       - name: site up
