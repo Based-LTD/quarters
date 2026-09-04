@@ -76,6 +76,56 @@
       ]
     },
     {
+      "name": "clear_flag",
+      "discriminator": [
+        47,
+        215,
+        227,
+        221,
+        159,
+        235,
+        27,
+        5
+      ],
+      "accounts": [
+        {
+          "name": "arcade",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  97,
+                  114,
+                  99,
+                  97,
+                  100,
+                  101
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "pot",
+          "writable": true
+        },
+        {
+          "name": "authority",
+          "signer": true,
+          "relations": [
+            "arcade"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "index",
+          "type": "u8"
+        }
+      ]
+    },
+    {
       "name": "close_expired_credit",
       "discriminator": [
         250,
@@ -842,6 +892,10 @@
               32
             ]
           }
+        },
+        {
+          "name": "flagged",
+          "type": "bool"
         }
       ]
     },
@@ -1434,6 +1488,10 @@
                 32
               ]
             }
+          },
+          {
+            "name": "flagged",
+            "type": "bool"
           }
         ]
       }

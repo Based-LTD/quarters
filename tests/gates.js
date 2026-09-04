@@ -169,7 +169,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   async function submitScore(credit, score) {
     const cr = await program.account.credit.fetch(credit);
     await program.methods
-      .submitScore(score, Array(32).fill(9))
+      .submitScore(score, Array(32).fill(9), false)
       .accounts({
         arcade: arcadePda,
         verifier: verifier.publicKey,
@@ -206,7 +206,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     try {
       const cr = await program.account.credit.fetch(forged);
       await program.methods
-        .submitScore(999999, Array(32).fill(6))
+        .submitScore(999999, Array(32).fill(6), false)
         .accounts({ arcade: arcadePda, verifier: players[0].publicKey, credit: forged, pot: potPda(cr.cabinetId, cr.day), rentPayer: cr.rentPayer })
         .signers([players[0]])
         .rpc();

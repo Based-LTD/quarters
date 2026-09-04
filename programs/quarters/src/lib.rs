@@ -313,7 +313,7 @@ pub mod quarters {
 
     // Verifier-signed: the score was recomputed from the credit's committed
     // seed and the published input log whose hash is replay_hash.
-    pub fn submit_score(ctx: Context<SubmitScore>, score: u32, replay_hash: [u8; 32]) -> Result<()> {
+    pub fn submit_score(ctx: Context<SubmitScore>, score: u32, replay_hash: [u8; 32], flagged: bool) -> Result<()> {
         let credit = &mut ctx.accounts.credit;
         require!(!credit.consumed, QuartersError::CreditConsumed);
         // A run must be verified within SUBMIT_WINDOW of paying: a max-length
@@ -331,6 +331,7 @@ pub mod quarters {
             player: credit.player,
             score,
             replay_hash,
+            flagged,   // verifier's behavior analysis: held from payout until cleared
         };
         let n = pot.count as usize;
         let mut pos = n;
@@ -447,7 +448,9 @@ pub mod quarters {
         // one player takes it all, two split 3000:1800, and so on. Only
         // rounding dust falls through to the treasury.
         let rank_bps = |i: usize| -> u64 { if i < 3 { PODIUM_BPS[i] } else { TAIL_BPS_TOTAL / 7 } };
-        let present_bps: u64 = (0..n).map(rank_bps).sum();
+        // Flagged entries (verifier behavior analysis, not cleared by review) are
+        // held out: they take nothing and the rest split the pool.
+        let present_bps: u64 = (0..n).filter(|&i| !ctx.accounts.pot.entries[i].flagged).map(rank_bps).sum();
         let mut paid_total: u64 = 0;
         for (i, winner) in ctx.remaining_accounts.iter().enumerate() {
             require_keys_eq!(
@@ -455,7 +458,7 @@ pub mod quarters {
                 ctx.accounts.pot.entries[i].player,
                 QuartersError::WrongWinnerAccounts
             );
-            let bps = rank_bps(i);
+            let bps = if ctx.accounts.pot.entries[i].flagged { 0 } else { rank_bps(i) };
             let amount = if present_bps == 0 { 0 } else { pool * bps / present_bps };
             **ctx.accounts.pot.to_account_info().try_borrow_mut_lamports()? -= amount;
             **winner.try_borrow_mut_lamports()? += amount;
@@ -525,6 +528,16 @@ pub mod quarters {
         require!(Clock::get()?.unix_timestamp > credit.inserted_at + SUBMIT_WINDOW, QuartersError::SubmitWindow);
         Ok(())
     }
+
+    // Review outcome: the authority clears a flagged entry so it pays out at
+    // settle. (A flag that stands simply pays nothing; there is no "confirm".)
+    pub fn clear_flag(ctx: Context<ClearFlag>, index: u8) -> Result<()> {
+        let pot = &mut ctx.accounts.pot;
+        require!(!pot.settled, QuartersError::PotSettled);
+        require!((index as usize) < pot.count as usize, QuartersError::WrongWinnerAccounts);
+        pot.entries[index as usize].flagged = false;
+        Ok(())
+    }
 }
 
 // ---------- state ----------
@@ -558,6 +571,7 @@ pub struct PotEntry {
     pub player: Pubkey,
     pub score: u32,
     pub replay_hash: [u8; 32],
+    pub flagged: bool,
 }
 
 #[account]
@@ -989,4 +1003,13 @@ pub struct CloseExpiredCredit<'info> {
     /// CHECK: rent refund destination; must be whoever fronted the rent
     #[account(mut, constraint = rent_payer.key() == credit.rent_payer @ QuartersError::WrongPlayer)]
     pub rent_payer: UncheckedAccount<'info>,
+}
+
+#[derive(Accounts)]
+pub struct ClearFlag<'info> {
+    #[account(seeds = [b"arcade"], bump = arcade.bump, has_one = authority)]
+    pub arcade: Account<'info, Arcade>,
+    #[account(mut, seeds = [b"pot".as_ref(), &[pot.cabinet_id], &pot.day.to_le_bytes()], bump)]
+    pub pot: Account<'info, DailyPot>,
+    pub authority: Signer<'info>,
 }

@@ -140,7 +140,7 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
   {
     const cr = await program.account.credit.fetch(tabCredits[0]);
     await program.methods
-      .submitScore(777, Array(32).fill(3))
+      .submitScore(777, Array(32).fill(3), false)
       .accounts({
         arcade: arcadePda,
         verifier: verifier.publicKey,

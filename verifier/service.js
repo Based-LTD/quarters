@@ -206,6 +206,11 @@ async function chainSubmit(creditIdB58, body, result) {
   }
   if (cabGame !== body.game) return { ok: false, code: 422, reason: `credit is for ${cabGame}, not ${body.game}` };
 
+  // Per-wallet volume this period feeds the behavior analysis.
+  { const w = credit.player.toBase58(); const v = walletVolume.get(w); const dayNow = credit.day;
+    const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
+    result.tas = analyzeInputs(result.masks || [], { volume: count }); }
+
   // The chain's commitment is the truth: sha256(secret) must equal it.
   const commit = crypto.createHash("sha256").update(Buffer.from(body.secret, "hex")).digest();
   if (!commit.equals(Buffer.from(credit.seedCommit))) {
@@ -240,7 +245,7 @@ async function chainSubmit(creditIdB58, body, result) {
     var bountyNote = { claimed: false, record: b.record, poolLamports: poolBefore };
   }
   const sig = await program.methods
-    .submitScore(result.score, Array.from(replayHash))
+    .submitScore(result.score, Array.from(replayHash), !!result.tas.flagged)
     .accounts({
       arcade: arcadePda,
       verifier: kp.publicKey,
@@ -256,29 +261,55 @@ async function chainSubmit(creditIdB58, body, result) {
 // input-edge gaps are overwhelmingly identical gets flagged for review —
 // flagged runs still verify, but the flag rides the receipt and the on-chain
 // path can hold payouts above a threshold on it.
-function tasFlags(masks) {
-  const gaps = [];
-  let prev = 0, lastEdge = -1;
+// Behavior analysis v2. Every replay carries the player's input mask for every
+// tick, so we can ask questions a bot answers differently from a person:
+//   • regularity: are inter-press gaps machine-even? (modal share, CV of gaps)
+//   • speed: how often are distinct decisions faster than a human can make them?
+//   • warm-up: does play start at tick 0 (a bot) or after a human beat?
+//   • hold shape: are key-hold durations quantized to a few exact values?
+//   • volume: how many paid runs has this wallet submitted this period?
+// Each signal is a soft score; a run is FLAGGED when enough of them agree.
+// A flag never blocks a score — it holds the payout for review (clear_flag).
+const walletVolume = new Map();   // wallet → { day, count }
+function analyzeInputs(masks, ctx = {}) {
+  const gaps = [], holds = [];
+  let prev = 0, lastEdge = -1, firstInput = -1, holdLen = 0, holdMask = 0;
   for (let i = 0; i < masks.length; i++) {
-    const edges = masks[i] & ~prev;
-    if (edges) {
-      if (lastEdge >= 0) gaps.push(i - lastEdge);
-      lastEdge = i;
-    }
-    prev = masks[i];
+    const m = masks[i] & 0xff;   // low byte: buttons (pointer games pack coords above)
+    if (m && firstInput < 0) firstInput = i;
+    const edges = m & ~prev;
+    if (edges) { if (lastEdge >= 0) gaps.push(i - lastEdge); lastEdge = i; }
+    if (m === holdMask) holdLen++; else { if (holdMask && holdLen > 0) holds.push(holdLen); holdMask = m; holdLen = 1; }
+    prev = m;
   }
-  if (gaps.length < 30) return { flagged: false, edgeGaps: gaps.length };
-  const counts = new Map();
-  for (const g of gaps) counts.set(g, (counts.get(g) || 0) + 1);
-  let modal = 0;
-  for (const c of counts.values()) modal = Math.max(modal, c);
-  const modalShare = modal / gaps.length;
-  return {
-    flagged: modalShare > 0.9,
-    edgeGaps: gaps.length,
-    modalShare: Math.round(modalShare * 100) / 100,
-  };
+  const n = gaps.length;
+  const f = { edges: n, firstInput, modalShare: 0, gapCv: 0, fastShare: 0, holdQuant: 0, volume: ctx.volume || 0 };
+  const signals = [];
+  if (n >= 30) {
+    const counts = new Map(); for (const g of gaps) counts.set(g, (counts.get(g) || 0) + 1);
+    f.modalShare = Math.max(...counts.values()) / n;
+    const mean = gaps.reduce((a, b) => a + b, 0) / n;
+    const sd = Math.sqrt(gaps.reduce((a, g) => a + (g - mean) * (g - mean), 0) / n);
+    f.gapCv = mean > 0 ? sd / mean : 0;
+    f.fastShare = gaps.filter((g) => g <= 2).length / n;          // ≤ 33 ms between distinct presses
+    if (f.modalShare > 0.9) signals.push("metronome");            // one exact gap almost always
+    else if (f.gapCv < 0.12) signals.push("too-regular");         // humans: CV ≈ 0.3–0.8
+    if (f.fastShare > 0.35) signals.push("superhuman-speed");
+    if (holds.length >= 30) {
+      const hc = new Map(); for (const h of holds) hc.set(h, (hc.get(h) || 0) + 1);
+      f.holdQuant = Math.max(...hc.values()) / holds.length;
+      if (f.holdQuant > 0.9) signals.push("quantized-holds");
+    }
+    if (firstInput >= 0 && firstInput < 3 && masks.length > 600) signals.push("no-warmup");
+  }
+  if ((ctx.volume || 0) > 60) signals.push("volume");           // > 60 paid runs this period from one wallet
+  // Score: strong signals count double. Flag at 2+ points, so one soft trait
+  // alone (a fast player, a warm-up skip) never flags a person.
+  const weight = { metronome: 2, "too-regular": 1, "superhuman-speed": 1, "quantized-holds": 1, "no-warmup": 1, volume: 2 };
+  const score = signals.reduce((a, s) => a + (weight[s] || 1), 0);
+  return { flagged: score >= 2, score, signals, features: f, edgeGaps: n, modalShare: Math.round(f.modalShare * 100) / 100 };
 }
+function tasFlags(masks) { return analyzeInputs(masks); }
 
 function verifyRun(body) {
   const { creditId, game, seed, seedCommit, inputsRLE, claimedScore, claimedHash } = body;
@@ -318,6 +349,7 @@ function verifyRun(body) {
   const commit = commitBuf.toString("hex");
 
   const masks = Engine.decodeRLE(inputsRLE);
+  var _masksForAnalysis = masks;
   if (masks.length > Engine.MAX_TICKS + 1000) return { ok: false, reason: "log too long" };
   const t0 = process.hrtime.bigint();
   const result = Engine.runHeadless(seed | 0, masks);
@@ -332,7 +364,7 @@ function verifyRun(body) {
   }
 
   const tas = tasFlags(masks);
-  return { ok: true, score: result.score, hash: result.hash, ticks: result.ticks, verifyMs, tas, seedCommitHex: commit };
+  return { ok: true, masks, score: result.score, hash: result.hash, ticks: result.ticks, verifyMs, tas, seedCommitHex: commit };
 }
 
 function signVerdict(v) {
@@ -373,7 +405,7 @@ const server = http.createServer((req, res) => {
           const pot = await program.account.dailyPot.fetch(potPda(cab, day));
           const lamports = await chain.conn.getBalance(potPda(cab, day));
           const entries = pot.entries.slice(0, pot.count)
-            .map((e) => ({ player: e.player.toBase58(), score: e.score }))
+            .map((e) => ({ player: e.player.toBase58(), score: e.score, flagged: !!e.flagged }))
             .sort((a, b) => b.score - a.score);
           boards.push({ cabinetId: cab, potLamports: lamports, count: entries.length, top: entries.slice(0, 3) });
         } catch (e) { /* no pot */ }
@@ -400,6 +432,7 @@ const server = http.createServer((req, res) => {
           player: e.player.toBase58(),
           score: e.score,
           replayHash: Buffer.from(e.replayHash).toString("hex"),
+          flagged: !!e.flagged,
         }));
         potLamports = await chain.conn.getBalance(potPda(cabId, day));
       } catch (e) { /* no pot yet this period */ }
@@ -558,6 +591,7 @@ const server = http.createServer((req, res) => {
         replayHash: result.hash,
         ticks: result.ticks,
         tasFlagged: result.tas.flagged,
+        analysis: { score: result.tas.score, signals: result.tas.signals, features: result.tas.features },
         verifiedAt: Date.now(),
         engineHash: ENGINE_HASH[parsed.game],
       };
