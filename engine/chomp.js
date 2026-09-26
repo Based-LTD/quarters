@@ -242,7 +242,10 @@ const Chomp = (() => {
         moveEntity(w, SPEED);
       } else {
         if (aligned(w)) w.dir = chooseWispDir(s, i, w);
-        moveEntity(w, s.fright > 0 ? FRIGHT_SPEED : SPEED);
+        // The tunnel is open to wisps as in the original, but it slows them
+        // to half speed so the player can use it to shake a chase.
+        const inTunnel = Math.trunc(w.y / TILE) === TUNNEL_ROW && (w.x < 2 * TILE || w.x > (COLS - 3) * TILE);
+        moveEntity(w, s.fright > 0 || inTunnel ? FRIGHT_SPEED : SPEED);
       }
 
       const dx = Math.abs(w.x - s.px), dy = Math.abs(w.y - s.py);

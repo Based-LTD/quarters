@@ -1,35 +1,42 @@
 # QUARTERS — follow the money
 
-**[quarters.fun](https://quarters.fun)** is a pay-to-play arcade on Solana. A play costs a quarter (0.0025 SOL), every score is a replay anyone can re-run, and every pot pays out on-chain.
+**[quarters.fun](https://quarters.fun)** is a pay-to-play arcade on **Robinhood Chain**. A play costs a quarter (0.0002 ETH), every score is a replay anyone can re-run, and every pot pays out on-chain.
 
-This repo is published so you don't have to trust us. It contains the on-chain program, the verifier that decides scores, the deterministic game engines, and a one-command tool that re-executes any receipt on your own machine.
+This repo is published so you don't have to trust us. It contains the contract, the verifier that decides scores, the deterministic game engines, and a one-command tool that re-executes any receipt on your own machine.
 
 | | |
 |---|---|
-| Program (devnet) | `GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a` |
-| Verifier | `https://quarters-verifier.fly.dev` |
-| Status | **devnet public preview** — test SOL, no value, no token |
+| Chain | Robinhood Chain mainnet (chain id 4663) |
+| Contract | [`0x64d59b679728aa1d155a27c7f391c30c8e2d0b56`](https://robinhoodchain.blockscout.com/address/0x64d59b679728aa1d155a27c7f391c30c8e2d0b56) |
+| Verifier (signer) | `0xAe9DC3F08f7593Bc0eD4be4709e2dC58b80f678C` · API `https://quarters-rh-mainnet.fly.dev` |
+| Treasury | `0xBdB31Ab1F4070941e7573390f4c12054ed085335` |
+| Source | [`contracts/src/Quarters.sol`](contracts/src/Quarters.sol) |
 
 ## Where every quarter goes
 
-A quarter splits three ways *inside the program*, in the same transaction that inserts it. There is no "pending balance" anywhere and nothing to withdraw from.
+A quarter splits *inside the contract*, in the same transaction that pays it (`_credit` in `Quarters.sol`):
 
 ```
-insert_coin / start_run          programs/quarters/src/lib.rs
-  quarter = cabinet stake, or the arcade default (0.0025 SOL)
-  pot_cut      = quarter * 7000 / 10_000   → the cabinet's DailyPot PDA   (70%)
-  operator_cut = quarter * 1500 / 10_000   → the cabinet deed's operator  (15%)
-  house_cut    = the remainder             → the treasury                  (15%)
+insertCoin / startRun
+  quarter      = the cabinet's stake, or quarterWei (0.0002 ETH)
+  pot share    = 70%   → that cabinet's pot for the day  (THE BOUNTY: its bounty pool)
+  operator     = 15%   → the cabinet's operator
+  gas leg      =  7%   → the verifier signer, which pays gas to write scores and settle pots
+  house        = the remainder (8%) → the treasury
 ```
 
-The pot is a program-owned account. Lamports leave it only through `settle_pot`, which:
+Pots are balances inside the contract. Wei leaves a pot only through `settlePot`, which:
 
-1. can be called by **anyone** once the scoring period ends (permissionless),
-2. verifies the winners passed in against the scores the verifier wrote on-chain,
-3. pays the podium and tail by the published table, sweeps rounding dust and zero-winner pools to the treasury, and
+1. can be called by **anyone** once the day is over (plus a grace window of min(period/4, 21 min)),
+2. pays the top 10 unflagged scores by a fixed table: **30% / 18% / 12%** for ranks 1–3 and **40% split evenly** across ranks 4–10, renormalized over the ranks actually present,
+3. sends rounding dust, or the whole pot if nobody played, to the treasury, and
 4. can never run twice for the same pot.
 
-Read it: [`settle_pot` in lib.rs](programs/quarters/src/lib.rs). Test it: [`tests/gate5-settle-edges.js`](tests/gate5-settle-edges.js) exercises the zero-winner sweep, the 4-winner tail split (400/7 bps each), wrong-count and wrong-identity rejection, and double-settle rejection against live devnet.
+A payout that a recipient contract refuses is not lost: it accrues to `owed[addr]` and `withdraw()` pays it out.
+
+## THE BOUNTY
+
+Cabinet 2 is VOID ROCKS with no daily reset. Its pot share accrues to a standing pool. The first unflagged score above **max(current record, floor)** takes the whole pool, paid inside the same `submitScores` call that records the score. The floor is 50,000 (`bountyFloor(2)`). A run is capped at 10 minutes of play.
 
 ## How a score becomes true
 
@@ -37,62 +44,59 @@ Read it: [`settle_pot` in lib.rs](programs/quarters/src/lib.rs). Test it: [`test
 score = f(committed_seed, your_inputs)
 ```
 
-1. **Commit.** `insert_coin` (or a pack's `start_run`) stores `sha256(seed)` in a Credit account *before* you play. No re-rolls.
+1. **Commit.** Paying for a play stores your seed commitment on-chain *before* you play, salted with the previous block hash so seeds can't be shopped. No re-rolls.
 2. **Play.** The engine is deterministic: integer-only state, fixed 60 Hz timestep, seeded PRNG. The client records your input bitmask every tick.
 3. **Submit the recording, not the score.** The client POSTs `{creditId, game, seed, inputsRLE, claimedScore, claimedHash}` to the verifier.
-4. **Re-execute.** The verifier checks the seed against the on-chain commitment, replays the inputs from scratch with the same engine, and only if the score and state hash reproduce exactly does it call `submit_score` with its signer key. It also publishes the receipt.
+4. **Re-execute.** The verifier checks the secret against the on-chain commitment, replays the inputs from scratch with the same engine, and only if the score and state hash reproduce exactly does it call `submitScores`. It publishes the receipt, and the on-chain `ScoreSubmitted` event carries the replay hash.
 5. **Anyone can re-run it.** See below.
 
-Bots are a risk in any skill contest. The verifier flags runs whose input timing is machine-regular (`tasFlags` in `verifier/service.js`); flagged runs carry the flag on their public receipt and can be held from payout.
+Bots are a risk in any skill contest. The verifier flags runs whose input timing is machine-regular (`analyzeInputs` in `verifier/service.js`). Flagged runs still go on the board with the flag on their receipt, but a flagged entry is skipped at settlement and cannot take THE BOUNTY.
 
 ## Re-run a receipt yourself
 
 ```bash
 npm install
-node tools/replay.js https://quarters-verifier.fly.dev/replays/<creditId>.json
+node tools/replay.js https://quarters-rh-mainnet.fly.dev/replays/<creditId>.json
 ```
 
-It loads the engine, replays the recorded inputs against the committed seed, and prints `REPRODUCED` or `MISMATCH`. Every receipt linked from a leaderboard or player page can be checked this way.
+It loads the engine, replays the recorded inputs against the committed seed, and prints `REPRODUCED` or `MISMATCH`.
 
 Public verifier endpoints:
 
 ```
 GET /leaderboards               every cabinet's pot and top three, this period
-GET /leaderboard/:cabinetId     one cabinet, straight from the chain
-GET /player/:wallet             a wallet's standings and receipts
-GET /replays/:creditId.json     the receipt
-GET /health
+GET /leaderboard/:cabinetId     one cabinet, straight from the chain (incl. bounty record, floor, pool)
+GET /replays/:creditId.json     a receipt
+GET /stats                      totals
+GET /health                     solvency, signer identity, gas runway, settlement freshness
 ```
 
 ## Packs and the session key
 
-A pack (`open_tab`) escrows a deposit in a per-wallet Tab PDA and funds a throwaway **session key** *from that deposit*, inside the program. The session key signs `start_run` so plays need no wallet popup. Your wallet only ever pays the program's escrow; `close_tab` refunds the unspent balance any time. Tested end to end in [`tests/gate-tab.js`](tests/gate-tab.js).
+A pack (`openTab(sessionKey, sessionFloat)`) escrows your deposit in the contract under your address and hands a small gas float to a throwaway **session key** held in your browser. The session key can only call `startRun` for *your* tab, which spends one quarter through the same split as `insertCoin`. It cannot move escrow anywhere else. `closeTab()` returns the unspent balance to your wallet at any time.
+
+## Trust assumptions — what we can and can't do
+
+- **The verifier key is trusted to be honest about scores.** It is the only key that can submit scores. Every score it writes carries a replay hash, and every receipt is public and re-runnable, so a fake score is detectable after the fact. It cannot be prevented by the contract.
+- **The authority key** (`authority()`) can change config: the quarter price, the split, the period, the verifier and treasury addresses, cabinet stakes and operators, the bounty floor, and it can clear a verifier flag. It **cannot** withdraw a pot, the bounty pool, or anyone's escrow directly. Because it can replace the verifier, it is ultimately trusted too. It is being moved to a hardware wallet.
+- Config changes emit events; watch the contract.
 
 ## What's in here
 
 ```
-programs/quarters/   the Anchor program (Rust)
-idl/quarters.json    its IDL
-verifier/            the verifier service + its determinism and API tests
+contracts/           Quarters.sol + BountyFeeder.sol, Foundry tests, forge-std, the ABI
+verifier/            the verifier service, its EVM chain adapter, and its tests
 engine/              24 deterministic game engines (plain JS, shared verbatim by client and verifier)
 tools/replay.js      re-run any receipt
-tests/               live devnet gate tests for every money path
-docs/MONEY_ROUTE.md  the gate log
 ```
 
 Not in here: the website and brand source, deploy keys, and infrastructure config.
 
-## Verify the deployed program matches this source
-
 ```bash
-anchor build --verifiable
-solana-verify verify-from-repo -um --program-id GixGVpDZpCxVcnpfWcSPwXF8rtjYrBGmmpkSdZq7kb7a https://github.com/Based-LTD/quarters
+npm test                          # engine determinism + verifier API tests
+cd contracts && forge test        # contract tests
 ```
-
-(Verified-build publication happens with the mainnet deploy.)
 
 ## Contact
 
 hello@quarters.fun · [@quartersfun](https://x.com/quartersfun) · BASED LTD
-
-QUARTERS has no token. Anything claiming otherwise is fake.

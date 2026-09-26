@@ -55,14 +55,42 @@ const STARTED_AT = Date.now();
 const readCache = { lb: null };
 const keyBal = { lamports: null, at: 0 };
 const healthCache = { arcade: null };
-setInterval(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); const a = await chain.program.account.arcade.fetch(chain.arcadePda); healthCache.arcade = { verifier: a.verifier.toBase58(), treasury: a.treasury.toBase58(), period: a.periodSeconds }; } catch (e) {} }, 60_000).unref();
-setTimeout(async () => { if (!chain) return; try { keyBal.lamports = await chain.conn.getBalance(chain.kp.publicKey); keyBal.at = Date.now(); const a = await chain.program.account.arcade.fetch(chain.arcadePda); healthCache.arcade = { verifier: a.verifier.toBase58(), treasury: a.treasury.toBase58(), period: a.periodSeconds }; } catch (e) {} }, 3000);
+async function refreshHealth() { if (!chain) return; try { keyBal.lamports = await chain.signerBalance(); keyBal.at = Date.now(); const c = await chain.config(); healthCache.arcade = { verifier: c.verifier, treasury: c.treasury, period: c.periodSeconds }; if (chain.kind === "evm") healthCache.gas = { gwei: await chain.gasPriceGwei(), quarter: c.quarter, gasBps: await chain.gasBps() }; } catch (e) {} }
+setInterval(refreshHealth, 60_000).unref(); setTimeout(refreshHealth, 3000);
 const submitHits = new Map();   // ip → [timestamps]
 setInterval(() => { const now = Date.now(); for (const [k, v] of submitHits) { const keep = v.filter((t) => now - t < 60_000); if (keep.length) submitHits.set(k, keep); else submitHits.delete(k); } }, 60_000).unref();
 const inFlight = new Set();     // creditIds being verified right now
-
 const RECEIPTS_DIR = process.env.RECEIPTS_DIR || path.join(__dirname, "receipts");
 const KEY_FILE = process.env.VERIFIER_KEY_FILE || path.join(__dirname, "verifier-key.json");
+// Launch controls (Fly env): LIVE_CABS="1,3,4,9,15,16" limits the floor to a set of
+// cabinets (empty = all 31); HOUSE_ADD_LAMPORTS seeds every live pot once per period
+// from the signer key, recorded so it never double-seeds. Small JSON state lives
+// next to the receipts: stats.json (paid-out counter), house-adds.json, names.json.
+const LIVE_CABS = (process.env.LIVE_CABS || "").split(",").map((x) => parseInt(x, 10)).filter((n) => n >= 1 && n <= 31);
+const isLive = (cab) => LIVE_CABS.length === 0 || LIVE_CABS.includes(cab);
+const HOUSE_ADD = Math.max(0, parseInt(process.env.HOUSE_ADD_LAMPORTS || "0", 10) || 0);
+function jsonFile(name, fallback) { try { return JSON.parse(fs.readFileSync(path.join(RECEIPTS_DIR, name), "utf8")); } catch (e) { return fallback; } }
+function saveJson(name, obj) { fs.mkdirSync(RECEIPTS_DIR, { recursive: true }); const f = path.join(RECEIPTS_DIR, name); fs.writeFileSync(f + ".tmp", JSON.stringify(obj)); fs.renameSync(f + ".tmp", f); }
+const stats = Object.assign({ paidOutLamports: 0, potsSettled: 0, potsPaid: 0, houseAddedLamports: 0, updatedAt: null }, jsonFile("stats.json", {}));
+const houseAdds = jsonFile("house-adds.json", {});
+const buybacks = jsonFile("buybacks.json", []);   // public receipts of the buyback lane
+const names = jsonFile("names.json", {});            // wallet -> { name, at }
+const nameOf = (w) => (names[w] && names[w].name) || null;
+const GAME_NAMES = { 1: "VOID ROCKS", 2: "VR BOUNTY", 3: "BREAKPOINT", 4: "SWARM", 5: "MOTH", 6: "LANDER", 7: "HOPPER", 8: "AIRTIME", 9: "CHOMP", 10: "GIRDER", 11: "STACK", 12: "VORTEX", 13: "MINER", 14: "GRIDLOCK", 15: "APEX", 16: "MYRIAPOD", 17: "OVERRUN", 18: "SKYFALL", 19: "CLAIM", 20: "CANNONADE", 21: "EXODUS", 22: "CONDUIT", 23: "LOB", 24: "SUMMIT", 25: "COIL", 26: "VOID ROCKS BR", 27: "BREAKPOINT BR", 28: "SWARM BR", 29: "AIRTIME BR", 30: "APEX BR", 31: "MYRIAPOD BR" };
+// Settle records (one file per period) feed the daily X post and the public results.
+const SETTLES = path.join(RECEIPTS_DIR, "settles"); fs.mkdirSync(SETTLES, { recursive: true });
+function recordSettle(day, period, cab, pool, houseAdd, entries) {
+  const f = path.join(SETTLES, day + ".json"); let rec = { day, periodSeconds: period, cabs: {} };
+  try { rec = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) {}
+  const bps = (i) => (i < 3 ? [3000, 1800, 1200][i] : 4000 / 7);
+  const present = entries.reduce((a, e, i) => a + (e.flagged ? 0 : bps(i)), 0);
+  rec.cabs[cab] = { pool, houseAdd, entries: entries.map((e, i) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged, payout: e.flagged || present === 0 ? 0 : Math.floor(pool * bps(i) / present) })) };
+  fs.writeFileSync(f + ".tmp", JSON.stringify(rec)); fs.renameSync(f + ".tmp", f);
+}
+const poster = require("./poster.js")({ dir: RECEIPTS_DIR, network: process.env.QR_NETWORK || "devnet", log: console.log });
+console.log(`poster: ${poster.dryRun ? "DRY RUN (drafts only)" : "LIVE"} · keys ${poster.configured ? "set" : "missing"} · cap ${poster.max}/day · time ${process.env.POST_TIME_UTC || "00:35"} UTC`);
+let potRentCache = null;
+const potRent = (c) => c.potRent();
 const REVIEW_SCORE = 0x7fffffff; // v1: no auto-payout gate on-chain yet
 
 fs.mkdirSync(RECEIPTS_DIR, { recursive: true });
@@ -87,32 +115,17 @@ const KEYS = loadOrCreateKey();
 // Devnet on-chain mode: fetch credits from chain (their stored seed_commit is
 // authoritative) and push verified scores via submit_score.
 let chain = null;
-if (process.env.DEVNET_SUBMIT === "1") {
-  const anchor = require("@coral-xyz/anchor");
-  const idl = JSON.parse(fs.readFileSync(path.join(__dirname, "../idl/quarters.json")));
-  // Hosted deploys pass the keypair via env; local runs use the file.
-  const kp = anchor.web3.Keypair.fromSecretKey(
-    Uint8Array.from(
-      process.env.VERIFIER_SOLANA_KEY
-        ? JSON.parse(process.env.VERIFIER_SOLANA_KEY)
-        : JSON.parse(fs.readFileSync(path.join(__dirname, "verifier-solana-devnet.json")))
-    )
-  );
-  const conn = new anchor.web3.Connection(process.env.RPC_URL || "https://api.devnet.solana.com", "confirmed");
-  const provider = new anchor.AnchorProvider(conn, new anchor.Wallet(kp), { commitment: "confirmed" });
-  const program = new anchor.Program(idl, provider);
-  const PID = program.programId;
-  const potPda = (cabId, day) => {
-    const d = Buffer.alloc(4);
-    d.writeUInt32LE(day);
-    return anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("pot"), Buffer.from([cabId]), d], PID)[0];
-  };
-  const arcadePda = anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("arcade")], PID)[0];
-  const cabinetPda = (id) => anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("cabinet"), Buffer.from([id])], PID)[0];
-  const bountyPda = (id) => anchor.web3.PublicKey.findProgramAddressSync([Buffer.from("bounty"), Buffer.from([id])], PID)[0];
-  chain = { anchor, program, kp, conn, potPda, arcadePda, cabinetPda, bountyPda, cabinetGame: new Map(), cabinetBounty: new Map() };
-  console.log("devnet submit mode: verifier", kp.publicKey.toBase58(), "program", PID.toBase58());
+// One verifier, two rooms: CHAIN=evm talks to Quarters.sol (Robinhood Chain);
+// otherwise DEVNET_SUBMIT=1 talks to the Anchor program. Same interface either way.
+if (process.env.CHAIN === "evm") {
+  chain = require("./chains/evm.js")({ rpcUrl: process.env.RPC_URL, chainId: parseInt(process.env.EVM_CHAIN_ID || "46630", 10), contract: process.env.EVM_CONTRACT, privateKey: process.env.EVM_PRIVATE_KEY, network: process.env.QR_NETWORK || "robinhood-testnet" });
+} else if (process.env.DEVNET_SUBMIT === "1") {
+  const keyJson = process.env.VERIFIER_SOLANA_KEY ? JSON.parse(process.env.VERIFIER_SOLANA_KEY) : JSON.parse(fs.readFileSync(path.join(__dirname, "verifier-solana-devnet.json")));
+  chain = require("./chains/solana.js")({ rpcUrl: process.env.RPC_URL || "https://api.devnet.solana.com", keyJson, programId: process.env.PROGRAM_ID, network: process.env.QR_NETWORK || "devnet" });
 }
+const cabinetCache = new Map();   // cab → { game, operator, isBounty }
+async function cabinetInfo(cab) { if (cabinetCache.has(cab)) return cabinetCache.get(cab); const c = await chain.cabinet(cab); if (c) cabinetCache.set(cab, c); return c; }
+const sameAddr = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
 
 // ---- settle daemon: pay every finished pot, permissionlessly, on a timer ----
 // Scans cabinets 1..MAX_CAB for the last SETTLE_LOOKBACK periods; any pot that
@@ -122,55 +135,106 @@ if (process.env.DEVNET_SUBMIT === "1") {
 const settle = { enabled: process.env.SETTLE === "1", lastRun: null, lastOk: null, settled: 0, errors: 0, lastError: null, pending: 0, sweepErrors: 0, lastSweepErrors: 0, opened: 0, lastOpenError: null };
 async function settleSweep() {
   if (!chain) return;
-  const { anchor, program, kp, conn, potPda, arcadePda } = chain;
   const MAX_CAB = 31, LOOKBACK = parseInt(process.env.SETTLE_LOOKBACK || "7", 10);
   settle.lastRun = Date.now();
   settle.lastSweepErrors = settle.sweepErrors; settle.sweepErrors = 0;
   try {
-    const arcade = await program.account.arcade.fetch(arcadePda);
-    const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
-    const nowDay = Math.floor(Date.now() / 1000 / period);
+    const cfg = await chain.config(); const period = cfg.periodSeconds;
+    const nowDay = Math.floor((await chain.now()) / period);
     let pending = 0;
     for (let cab = 1; cab <= MAX_CAB; cab++) {
       for (let day = nowDay - LOOKBACK; day < nowDay; day++) {
-        const pk = potPda(cab, day);
-        let pot;
-        try { pot = await program.account.dailyPot.fetch(pk); } catch (e) { continue; }
-        if (!pot.initialized || pot.settled) continue;
+        let pot; try { pot = await chain.pot(cab, day); } catch (e) { continue; }
+        if (!pot || !pot.exists || pot.settled) continue;
         pending++;
-        const winners = pot.entries.slice(0, pot.count).map((e) => ({ pubkey: e.player, isWritable: true, isSigner: false }));
+        const pool = pot.pool, anyPaid = pot.entries.some((e) => !e.flagged);
         try {
-          const sig = await program.methods.settlePot()
-            .accounts({ arcade: arcadePda, pot: pk, treasury: arcade.treasury, potRentPayer: pot.rentPayer })   // v4: pot rent goes back to whoever opened it
-            .remainingAccounts(winners)
-            .rpc();
+          const { txSig } = await chain.settle(cab, day, pot);
           settle.settled++; pending--;
-          console.log(`settle: cabinet ${cab} day ${day} paid ${winners.length} winner(s) ${sig.slice(0, 12)}…`);
+          stats.potsSettled++; if (anyPaid && pool > 0) { stats.paidOutLamports += pool; stats.potsPaid++; }
+          stats.updatedAt = Date.now(); saveJson("stats.json", stats);
+          try { recordSettle(day, period, cab, Math.max(0, pool), (houseAdds[chain.potId(cab, day)] || {}).lamports || 0, pot.entries); } catch (e) { console.log("settle: record failed " + e.message); }
+          if (chain.kind === "evm") { try { await buybackLane(cab, day, pot); } catch (e) { console.log(`buyback: cab ${cab} day ${day} failed: ${String(e.message || e).slice(0, 160)}`); } }
+          console.log(`settle: cabinet ${cab} day ${day} settled ${pot.entries.length} entr${pot.entries.length === 1 ? "y" : "ies"} ${String(txSig).slice(0, 12)}…`);
         } catch (e) {
           const msg = String(e);
-          if (/DayNotOver/.test(msg)) continue;   // inside the settle grace; try next sweep
+          if (chain.isDayNotOver(msg)) { pending--; continue; }   // inside the settle grace: not stale
           settle.errors++; settle.sweepErrors++; settle.lastError = `cab ${cab} day ${day}: ${msg.slice(0, 140)}`;
           console.log("settle: FAILED " + settle.lastError);
         }
       }
     }
     settle.pending = pending;
-    // House pays the pot rent: pre-open this and next period's pots.
-    if (program.methods.openPot && period >= 3600) {   // never for short test periods
-      for (const day of [nowDay, nowDay + 1]) {
-        for (let cab = 1; cab <= MAX_CAB; cab++) {
-          const pk = potPda(cab, day);
-          try { const info = await conn.getAccountInfo(pk); if (info) continue; } catch (e) { continue; }
-          try {
-            await program.methods.openPot(day).accounts({ arcade: arcadePda, cabinet: chain.cabinetPda(cab), pot: pk, payer: kp.publicKey, systemProgram: anchor.web3.SystemProgram.programId }).rpc();
-            settle.opened = (settle.opened || 0) + 1;
-          } catch (e) { settle.sweepErrors++; settle.lastOpenError = `open_pot cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
-        }
+    // Solana: house pays the pot rent by pre-opening this and next period's pots (never for short test periods).
+    if (chain.canPreOpen && period >= 3600) {
+      for (const day of [nowDay, nowDay + 1]) for (let cab = 1; cab <= MAX_CAB; cab++) {
+        if (!isLive(cab) || !(await cabinetInfo(cab))) continue;
+        try { if (await chain.preOpen(cab, day)) settle.opened = (settle.opened || 0) + 1; }
+        catch (e) { settle.sweepErrors++; settle.lastOpenError = `open_pot cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
+      }
+    }
+    // House adds: seed each live pot once (this and next period) so no board is empty-handed.
+    if (HOUSE_ADD > 0) {
+      for (const day of [nowDay, nowDay + 1]) for (let cab = 1; cab <= MAX_CAB; cab++) {
+        if (!isLive(cab) || !(await cabinetInfo(cab))) continue;   // only cabinets that exist on this arcade
+        const key = chain.potId(cab, day);
+        if (houseAdds[key]) continue;
+        try {
+          const sig = await chain.houseAdd(cab, day, HOUSE_ADD);
+          if (!sig) continue;   // pot not there yet
+          houseAdds[key] = { cab, day, lamports: HOUSE_ADD, sig, at: Date.now() };
+          stats.houseAddedLamports += HOUSE_ADD; saveJson("stats.json", stats);
+          for (const k of Object.keys(houseAdds)) if (houseAdds[k].day < nowDay - 14) delete houseAdds[k];
+          saveJson("house-adds.json", houseAdds);
+          settle.houseAdded = (settle.houseAdded || 0) + 1;
+        } catch (e) { settle.sweepErrors++; settle.lastOpenError = `house add cab ${cab} day ${day}: ${String(e).slice(0, 100)}`; }
+      }
+    }
+    // EVM: the gas leg funds this key from revenue; sweep anything above the float cap to the treasury.
+    if (chain.kind === "evm") {
+      const cap = parseInt(process.env.EVM_FLOAT_CAP_WEI || "0", 10), floor = parseInt(process.env.EVM_FLOAT_FLOOR_WEI || "0", 10);
+      if (cap > 0 && floor > 0 && floor < cap) {
+        const bal = await chain.signerBalance();
+        if (bal > cap) { try { const sig = await chain.sendEth(cfg.treasury, bal - floor); stats.sweptToTreasuryLamports = (stats.sweptToTreasuryLamports || 0) + (bal - floor); saveJson("stats.json", stats); console.log(`float: swept ${chain.fmt(bal - floor)} ETH to treasury ${String(sig).slice(0, 12)}…`); } catch (e) { settle.sweepErrors++; settle.lastError = "float sweep: " + String(e).slice(0, 100); } }
       }
     }
     settle.lastOk = Date.now();
   } catch (e) { settle.errors++; settle.lastError = String(e).slice(0, 140); console.log("settle: sweep error " + settle.lastError); }
 }
+// Buyback lane (EVM, sponsored cabinets): after a sponsored cabinet settles, the
+// vault (this signer) pulls what accrued from quarters, market-buys the sponsor's
+// token through its pool, and hands the whole bag to the day's #1 unflagged player.
+// Every leg is a public receipt: accrued wei, swap tx, tokens out, bonus tx, winner.
+async function buybackLane(cab, day, pot) {
+  const sp = await chain.sponsor(cab); if (!sp) return;
+  if (!sameAddr(sp.vault, chain.signer)) return;   // another vault runs this cabinet's lane
+  const accrued = await chain.buybackAccrued(cab); if (accrued <= 0) return;
+  const rec = { cab, day, token: sp.token, accruedWei: accrued, at: new Date().toISOString() };
+  rec.withdrawTx = await chain.withdrawBuyback(cab);
+  const before = await chain.tokenBalance(sp.token);
+  const swap = await chain.buyToken(sp.token, accrued); rec.swapTx = swap.txSig; rec.poolFee = swap.fee;
+  const bought = (await chain.tokenBalance(sp.token)) - before; rec.tokensOut = bought.toString();
+  const winner = pot.entries.find((e) => !e.flagged);
+  if (winner && bought > 0n) { rec.winner = winner.player; rec.winnerName = nameOf(winner.player); rec.bonusTx = await chain.sendToken(sp.token, winner.player, bought); }
+  else rec.note = winner ? "swap returned nothing" : "no unflagged player — bag held in the vault";
+  buybacks.push(rec); saveJson("buybacks.json", buybacks.slice(-500));
+  console.log(`buyback: cab ${cab} day ${day} ${chain.fmt(accrued)} ETH → ${rec.tokensOut || 0} tokens → ${rec.winner || "held"}`);
+}
+// Daily results post: at POST_TIME_UTC, compose from the most recent settle record
+// that isn't already posted. Devnet never posts unless X_POST_DEVNET=1 (drafts still form).
+async function dailyPostTick() {
+  const [hh, mm] = (process.env.POST_TIME_UTC || "00:35").split(":").map((x) => parseInt(x, 10));
+  const now = new Date(); if (now.getUTCHours() !== hh || now.getUTCMinutes() !== mm) return;
+  const files = fs.readdirSync(SETTLES).filter((f) => f.endsWith(".json")).sort();
+  if (!files.length) return;
+  const rec = JSON.parse(fs.readFileSync(path.join(SETTLES, files[files.length - 1]), "utf8"));
+  const label = rec.periodSeconds >= 86400 ? new Date(rec.day * rec.periodSeconds * 1000).toISOString().slice(0, 10) : "period " + rec.day;
+  const composed = poster.composeDaily(rec, { games: GAME_NAMES, runs: (readCache.stats || {}).runs || 0, dayLabel: label });
+  if (!composed) return;
+  if ((process.env.QR_NETWORK || "devnet") !== "mainnet" && process.env.X_POST_DEVNET !== "1" && !poster.dryRun) return;
+  await poster.queue("results", composed.key, composed.text, composed.png);
+}
+setInterval(() => dailyPostTick().catch((e) => console.log("poster: tick error " + e.message)), 60000);
 if (settle.enabled && chain) {
   const every = Math.max(60, parseInt(process.env.SETTLE_INTERVAL_S || "300", 10)) * 1000;
   console.log(`settle daemon on: every ${every / 1000}s, lookback ${process.env.SETTLE_LOOKBACK || 7} periods`);
@@ -178,83 +242,52 @@ if (settle.enabled && chain) {
   setInterval(settleSweep, every);
 }
 
-async function chainSubmit(creditIdB58, body, result) {
-  const { anchor, program, kp, potPda, arcadePda } = chain;
-  const creditPk = new anchor.web3.PublicKey(creditIdB58);
-  // The player's wallet may have confirmed the coin on a faster RPC than
-  // ours; give a fresh credit a few seconds to appear before calling it gone.
-  let credit = null;
-  for (let i = 0; i < 4 && !credit; i++) {
-    try { credit = await program.account.credit.fetch(creditPk); }
-    catch (e) { if (i < 3) await new Promise((r) => setTimeout(r, 1500)); }
-  }
+async function chainSubmit(creditId, body, result) {
+  const credit = await chain.credit(creditId, body);
   if (!credit) return { ok: false, code: 410, reason: "credit not found (unpaid, or already scored)" };
-
+  if (credit.used) return { ok: false, code: 410, reason: "credit already scored" };
   // The credit's cabinet decides the game. A replay from a higher-scoring
   // engine must not be able to land in another cabinet's pot.
-  let cabGame = chain.cabinetGame.get(credit.cabinetId);
-  if (!cabGame) {
-    let cab = null;
-    for (let i = 0; i < 3 && !cab; i++) {
-      try { cab = await program.account.cabinet.fetch(chain.cabinetPda(credit.cabinetId)); }
-      catch (e) { if (i < 2) await new Promise((r) => setTimeout(r, 1000)); }
-    }
-    if (!cab) return { ok: false, code: 502, reason: "cabinet lookup failed" };
-    cabGame = Buffer.from(cab.game).toString("utf8").replace(/\0+$/, "");
-    chain.cabinetGame.set(credit.cabinetId, cabGame);
-    chain.cabinetBounty.set(credit.cabinetId, !!cab.isBounty);
-  }
-  if (cabGame !== body.game) return { ok: false, code: 422, reason: `credit is for ${cabGame}, not ${body.game}` };
-
+  const cab = await cabinetInfo(credit.cabinet);
+  if (!cab) return { ok: false, code: 502, reason: "cabinet lookup failed" };
+  if (cab.game !== body.game) return { ok: false, code: 422, reason: `credit is for ${cab.game}, not ${body.game}` };
   // Per-wallet volume this period feeds the behavior analysis.
-  { const w = credit.player.toBase58(); const v = walletVolume.get(w); const dayNow = credit.day;
+  { const w = credit.player; const v = walletVolume.get(w); const dayNow = credit.day;
     const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
     result.tas = analyzeInputs(result.masks || [], { volume: count }); }
-
   // The chain's commitment is the truth: sha256(secret) must equal it.
   const commit = crypto.createHash("sha256").update(Buffer.from(body.secret, "hex")).digest();
-  if (!commit.equals(Buffer.from(credit.seedCommit))) {
-    return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
-  }
-  if (Buffer.from(credit.salt).toString("hex") !== String(body.salt).toLowerCase()) {
-    return { ok: false, code: 422, reason: "salt does not match the credit" };
-  }
-
-  // The published replay hash: sha256 over the canonical replay record.
-  const replayHash = crypto
-    .createHash("sha256")
-    .update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE }))
-    .digest();
-
-  // Bounty cabinet: beat the standing record and claim_bounty pays the whole
-  // pool to the player; otherwise the attempt is recorded via submit_score
-  // (credit consumed, rent refunded) and the pool grows.
-  if (chain.cabinetBounty.get(credit.cabinetId)) {
-    const bountyPk = chain.bountyPda(credit.cabinetId);
-    const b = await program.account.bounty.fetch(bountyPk);
-    const poolBefore = (await chain.conn.getBalance(bountyPk)) - (await chain.conn.getMinimumBalanceForRentExemption(8 + 77));   // pool excludes rent
-    if (result.score > b.record) {
-      const sig = await program.methods
-        .claimBounty(result.score, Array.from(replayHash))
-        .accounts({ arcade: arcadePda, verifier: kp.publicKey, credit: creditPk, bounty: bountyPk, player: credit.player, rentPayer: credit.rentPayer })
-        .rpc();
-      return { ok: true, txSig: sig, replayHash: replayHash.toString("hex"), player: credit.player.toBase58(),
-        bounty: { claimed: true, previousRecord: b.record, newRecord: result.score, paidLamports: poolBefore } };
+  if (credit.commit && !commit.equals(credit.commit)) return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
+  if (credit.salt !== String(body.salt).toLowerCase()) return { ok: false, code: 422, reason: "salt does not match the credit" };
+  const replayHash = crypto.createHash("sha256").update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE })).digest();
+  const sub = { creditId, credit, player: credit.player, secret: body.secret, score: result.score, replayHash, flagged: !!result.tas.flagged };
+  // Bounty cabinet: an unflagged record takes the whole pool. A flagged record
+  // is held like any other flagged run — it goes on the board, nothing pays.
+  let bountyNote;
+  if (cab.isBounty) {
+    const b = await chain.bounty(credit.cabinet);
+    // bar = max(record, floor): the contract pays nothing below its floor, so
+    // neither do we claim, announce, or tell the player they won.
+    const bar = b.bar != null ? b.bar : b.record;
+    const isRecord = result.score > bar && !sub.flagged;
+    if (isRecord && !chain.bountyInSubmit) {
+      const { txSig } = await chain.claimBounty(credit.cabinet, sub);
+      announceBounty(credit.player, result.score, b.record, b.pool);
+      return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: credit.player, bounty: { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool } };
     }
-    // not a record: fall through to submit_score so the credit closes and the run is on the books
-    var bountyNote = { claimed: false, record: b.record, poolLamports: poolBefore };
+    if (isRecord) announceBounty(credit.player, result.score, b.record, b.pool);
+    bountyNote = isRecord ? { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool }
+      : { claimed: false, record: b.record, floor: b.floor || 0, bar, poolLamports: b.pool };
   }
-  const sig = await program.methods
-    .submitScore(result.score, Array.from(replayHash), !!result.tas.flagged)
-    .accounts({
-      arcade: arcadePda,
-      verifier: kp.publicKey,
-      credit: creditPk,
-      pot: potPda(credit.cabinetId, credit.day),
-      rentPayer: credit.rentPayer,
-    })
-    .rpc();
-  return { ok: true, txSig: sig, replayHash: replayHash.toString("hex"), player: credit.player.toBase58(), ...(typeof bountyNote !== "undefined" ? { bounty: bountyNote } : {}) };
+  const { txSig, batched } = await chain.submit(credit.cabinet, sub);
+  return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: credit.player, ...(bountyNote ? { bounty: bountyNote } : {}) };
+}
+function announceBounty(player, score, prevRecord, pool) {
+  if (!(pool > 0)) return;   // a record over an empty pool is not "took the whole pool: 0"
+  try {
+    const who = nameOf(player) || (player.slice(0, 4) + "…" + player.slice(-4));
+    poster.queue("bounty", "bounty:" + score + ":" + Date.now(), "THE BOUNTY just fell.\n\n" + who + " scored " + score + " on VOID ROCKS, beat the record of " + prevRecord + " and took the whole pool: " + chain.fmt(pool) + " " + chain.unit.symbol + ".\n\nNew record to beat: " + score + ". quarters.fun", null).catch(() => {});
+  } catch (e) {}
 }
 
 // TAS heuristic v1: humans have messy inter-press timing. A long run whose
@@ -313,7 +346,7 @@ function tasFlags(masks) { return analyzeInputs(masks); }
 
 function verifyRun(body) {
   const { creditId, game, seed, seedCommit, inputsRLE, claimedScore, claimedHash } = body;
-  if (typeof creditId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(creditId)) {
+  if (typeof creditId !== "string" || !/^[A-Za-z0-9_-]{1,66}$/.test(creditId)) {
     return { ok: false, reason: "bad creditId" };
   }
   const Engine = GAMES[game];
@@ -389,29 +422,96 @@ const server = http.createServer((req, res) => {
     return res.end();
   }
 
+  // Post drafts/log (public, no secrets): what the bot composed and whether it went out.
+  if (req.method === "GET" && req.url === "/posts") return send(200, { dryRun: poster.dryRun, configured: poster.configured, maxPerDay: poster.max, posts: poster.list().slice(0, 30) });
+  if (req.method === "GET" && /^\/posts\/[a-f0-9]{12}\.png$/.test(req.url)) {
+    const f = path.join(poster.dir, req.url.slice(7)); if (!fs.existsSync(f)) return send(404, { error: "no card" });
+    res.writeHead(200, { "content-type": "image/png", "access-control-allow-origin": "*" }); return res.end(fs.readFileSync(f));
+  }
+  // Admin: send a draft now, or compose a test post. ADMIN_TOKEN must match.
+  if (req.method === "POST" && /^\/posts\/(test|[a-f0-9]{12})\/send$/.test(req.url)) {
+    if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) return send(401, { error: "admin token" });
+    const id = req.url.split("/")[2];
+    (async () => {
+      if (id === "test") { const rec = await poster.queue("test", "test:" + Date.now(), "QUARTERS results bot online · " + new Date().toISOString().slice(0, 16) + "Z", null); return send(200, rec); }
+      return send(200, (await poster.send(id)) || { error: "no such draft" });
+    })().catch((e) => send(500, { error: String(e).slice(0, 200) }));
+    return;
+  }
+  // Buyback receipts (public): every sponsored-cabinet buyback with its transactions.
+  if (req.method === "GET" && req.url === "/buybacks") return send(200, { buybacks: buybacks.slice(-100).reverse() });
+  // Launch config the site reads at runtime (one source of truth: Fly env).
+  if (req.method === "GET" && req.url === "/config") {
+    return send(200, { liveCabinets: LIVE_CABS, houseAddLamports: HOUSE_ADD, network: process.env.QR_NETWORK || "devnet", chain: chain ? { kind: chain.kind, unit: chain.unit, contract: chain.contract } : null });
+  }
+  // The number on the wall: lamports paid to players by settled pots, plus run count.
+  if (req.method === "GET" && req.url === "/stats") {
+    if (!readCache.stats || Date.now() - readCache.stats.at > 60000) {
+      let runs = 0; try { runs = fs.readdirSync(RECEIPTS_DIR).filter((f) => f.endsWith(".json") && f.length > 40).length; } catch (e) {}
+      readCache.stats = { at: Date.now(), runs };
+    }
+    return send(200, Object.assign({}, stats, { runs: readCache.stats.runs, liveCabinets: LIVE_CABS.length || 31 }));
+  }
+  if (req.method === "GET" && req.url.startsWith("/names?")) {
+    const ws = (new URL(req.url, "http://x").searchParams.get("w") || "").split(",").slice(0, 50);
+    const out = {}; for (const w of ws) if (names[w]) out[w] = names[w].name;
+    return send(200, out);
+  }
+  // Claim a display name: the wallet signs "QUARTERS name: <name>" (Phantom signMessage).
+  // 3–16 chars [A-Za-z0-9_], unique case-insensitively, one change per wallet per hour.
+  if (req.method === "POST" && req.url === "/name") {
+    let raw = ""; req.on("data", (c) => { raw += c; if (raw.length > 2048) req.destroy(); });
+    req.on("end", () => {
+      try {
+        const b = JSON.parse(raw || "{}"); const name = String(b.name || "").trim();
+        if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) return send(422, { error: "name must be 3–16 letters, digits or _" });
+        const msg = "QUARTERS name: " + name;
+        if (b.message !== msg) return send(422, { error: "bad message" });
+        let w = String(b.wallet || "");
+        (async () => {
+          let ok = false;
+          if (/^0x[0-9a-fA-F]{40}$/.test(w)) {
+            // EVM: EIP-191 personal_sign, signature as 0x hex
+            const { verifyMessage, getAddress } = require("viem");
+            try { ok = await verifyMessage({ address: getAddress(w), message: msg, signature: String(b.signature || "") }); w = getAddress(w); } catch (e) { ok = false; }
+          } else {
+            const { PublicKey } = require("@coral-xyz/anchor").web3;
+            let pk; try { pk = new PublicKey(w); } catch (e) { return send(422, { error: "bad wallet" }); }
+            const sig = Buffer.from(String(b.signature || ""), "base64");
+            const spki = Buffer.concat([Buffer.from("302a300506032b6570032100", "hex"), Buffer.from(pk.toBytes())]);
+            ok = sig.length === 64 && crypto.verify(null, Buffer.from(msg, "utf8"), { key: spki, format: "der", type: "spki" }, sig);
+            w = pk.toBase58();
+          }
+          if (!ok) return send(401, { error: "signature does not match wallet" });
+          const lower = name.toLowerCase();
+        for (const [ow, v] of Object.entries(names)) if (ow !== w && v.name.toLowerCase() === lower) return send(409, { error: "that name is taken" });
+        if (names[w] && Date.now() - names[w].at < 3600000 && names[w].name !== name) return send(429, { error: "one name change per hour" });
+          names[w] = { name, at: Date.now() }; saveJson("names.json", names);
+          return send(200, { ok: true, wallet: w, name });
+        })().catch((e) => send(400, { error: String(e).slice(0, 120) }));
+      } catch (e) { return send(400, { error: String(e).slice(0, 120) }); }
+    });
+    return;
+  }
   // Current pot standings + bounty for a cabinet, straight off the chain.
   if (req.method === "GET" && req.url === "/leaderboards") {
     if (!chain) return send(503, { error: "chain mode off" });
     if (readCache.lb && Date.now() - readCache.lb.at < 8000) return send(200, readCache.lb.body);
     (async () => {
-      const { program, potPda } = chain;
-      const arcade = await program.account.arcade.fetch(chain.arcadePda);
-      const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
-      const day = Math.floor(Date.now() / 1000 / period);
-      const CABS = Array.from({ length: 31 }, (_, i) => i + 1);
+      const cfg = await chain.config(); const period = cfg.periodSeconds;
+      const day = Math.floor((await chain.now()) / period);
+      const CABS = Array.from({ length: 31 }, (_, i) => i + 1).filter(isLive);
       const boards = [];
       await Promise.all(CABS.map(async (cab) => {
         try {
-          const pot = await program.account.dailyPot.fetch(potPda(cab, day));
-          const lamports = await chain.conn.getBalance(potPda(cab, day));
-          const entries = pot.entries.slice(0, pot.count)
-            .map((e) => ({ player: e.player.toBase58(), score: e.score, flagged: !!e.flagged }))
-            .sort((a, b) => b.score - a.score);
-          boards.push({ cabinetId: cab, potLamports: lamports, count: entries.length, top: entries.slice(0, 3) });
+          const pot = await chain.pot(cab, day); if (!pot) return;
+          const entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged })).sort((a, b) => b.score - a.score);
+          const ha = houseAdds[chain.potId(cab, day)];
+          boards.push({ cabinetId: cab, potLamports: pot.balance, poolLamports: pot.pool, houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 3) });
         } catch (e) { /* no pot */ }
       }));
-      boards.sort((a, b) => b.potLamports - a.potLamports);
-      readCache.lb = { at: Date.now(), body: { day, periodSeconds: period, boards } };
+      boards.sort((a, b) => b.poolLamports - a.poolLamports);
+      readCache.lb = { at: Date.now(), body: { day, periodSeconds: period, unit: chain.unit, boards } };
       send(200, readCache.lb.body);
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
@@ -421,64 +521,45 @@ const server = http.createServer((req, res) => {
     if (!chain) return send(503, { error: "chain mode off" });
     const cabId = parseInt(req.url.split("/")[2], 10);
     (async () => {
-      const { anchor, program, potPda } = chain;
-      const arcade = await program.account.arcade.fetch(chain.arcadePda);
-      const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
-      const day = Math.floor(Date.now() / 1000 / period);
-      let entries = [], potLamports = 0;
+      const cfg = await chain.config(); const period = cfg.periodSeconds;
+      const day = Math.floor((await chain.now()) / period);
+      let entries = [], potLamports = 0, poolLamports = 0, houseAdd = 0;
       try {
-        const pot = await program.account.dailyPot.fetch(potPda(cabId, day));
-        entries = pot.entries.slice(0, pot.count).map((e) => ({
-          player: e.player.toBase58(),
-          score: e.score,
-          replayHash: Buffer.from(e.replayHash).toString("hex"),
-          flagged: !!e.flagged,
-        }));
-        potLamports = await chain.conn.getBalance(potPda(cabId, day));
+        const pot = await chain.pot(cabId, day);
+        if (pot) {
+          entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, replayHash: e.replayHash, flagged: e.flagged }));
+          potLamports = pot.balance; poolLamports = pot.pool;
+          const ha = houseAdds[chain.potId(cabId, day)]; houseAdd = ha ? ha.lamports : 0;
+        }
       } catch (e) { /* no pot yet this period */ }
       let bounty = null;
       try {
-        // only real bounty cabinets have a bounty; non-bounty cabinets may hold
-        // a phantom Bounty account (rent only) that must not be shown as a pool
-        let isB = chain.cabinetBounty.get(cabId);
-        if (isB === undefined) { const cab = await program.account.cabinet.fetch(chain.cabinetPda(cabId)); isB = !!cab.isBounty; chain.cabinetBounty.set(cabId, isB); }
-        if (isB) {
-          const bPda = chain.bountyPda(cabId);
-          const b = await program.account.bounty.fetch(bPda);
-          const rent = await chain.conn.getMinimumBalanceForRentExemption(8 + 77);
-          bounty = { record: b.record, champion: b.champion.toBase58(), lamports: Math.max(0, (await chain.conn.getBalance(bPda)) - rent) };
-        }
+        const cab = await cabinetInfo(cabId);
+        if (cab && cab.isBounty) { const b = await chain.bounty(cabId); bounty = { record: b.record, floor: b.floor || 0, bar: b.bar != null ? b.bar : b.record, champion: b.champion, lamports: b.pool }; }
       } catch (e) { /* no bounty */ }
-      send(200, { cabinetId: cabId, day, periodSeconds: period, entries, potLamports, bounty });
+      if (bounty && bounty.champion) bounty.championName = nameOf(bounty.champion);
+      let sponsor = null; if (chain.kind === "evm") { try { const sp = await chain.sponsor(cabId); if (sp) sponsor = { token: sp.token, buybackBps: sp.buybackBps, accruedWei: await chain.buybackAccrued(cabId), lastBuyback: buybacks.filter((b) => b.cab === cabId).slice(-1)[0] || null }; } catch (e) {} }
+      send(200, { cabinetId: cabId, day, periodSeconds: period, live: isLive(cabId), unit: chain.unit, entries, potLamports, poolLamports, houseAdd, bounty, sponsor });
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
   }
 
   // Player profile: current-period standings across every cabinet, plus
   // their public receipts. The wallet IS the account.
-  if (req.method === "GET" && /^\/player\/[1-9A-HJ-NP-Za-km-z]{32,44}$/.test(req.url)) {
+  if (req.method === "GET" && /^\/player\/(0x[0-9a-fA-F]{40}|[1-9A-HJ-NP-Za-km-z]{32,44})$/.test(req.url)) {
     if (!chain) return send(503, { error: "chain mode off" });
     const pubkey = req.url.split("/")[2];
     (async () => {
-      const { program, potPda } = chain;
-      const arcade = await program.account.arcade.fetch(chain.arcadePda);
-      const period = arcade.periodSeconds.toNumber ? arcade.periodSeconds.toNumber() : Number(arcade.periodSeconds);
-      const day = Math.floor(Date.now() / 1000 / period);
+      const cfg = await chain.config(); const period = cfg.periodSeconds;
+      const day = Math.floor((await chain.now()) / period);
       const CABS = Array.from({ length: 31 }, (_, i) => i + 1);
       const standings = [];
-      const pots = await Promise.all(CABS.map(async (cab) => {
-        try { return [cab, await program.account.dailyPot.fetch(potPda(cab, day))]; }
-        catch (e) { return null; }
-      }));
+      const pots = await Promise.all(CABS.map(async (cab) => { try { const p = await chain.pot(cab, day); return p ? [cab, p] : null; } catch (e) { return null; } }));
       for (const entry of pots) {
         if (!entry) continue;
         const [cab, pot] = entry;
-        const sorted = pot.entries.slice(0, pot.count)
-          .map((e, i) => ({ player: e.player.toBase58(), score: e.score }))
-          .sort((a, b) => b.score - a.score);
-        sorted.forEach((e, rank) => {
-          if (e.player === pubkey) standings.push({ cabinetId: cab, rank: rank + 1, score: e.score, of: sorted.length });
-        });
+        const sorted = pot.entries.map((e) => ({ player: e.player, score: e.score })).sort((a, b) => b.score - a.score);
+        sorted.forEach((e, rank) => { if (sameAddr(e.player, pubkey)) standings.push({ cabinetId: cab, rank: rank + 1, score: e.score, of: sorted.length }); });
       }
       // Receipts: newest 200 files, matched by player.
       const receipts = [];
@@ -491,7 +572,7 @@ const server = http.createServer((req, res) => {
         for (const { f } of files) {
           try {
             const r = JSON.parse(fs.readFileSync(path.join(RECEIPTS_DIR, f)));
-            if (r.onchain && r.onchain.player === pubkey) {
+            if (r.onchain && sameAddr(r.onchain.player, pubkey)) {
               receipts.push({
                 creditId: r.creditId, game: r.game, score: r.verdict.score,
                 ticks: r.verdict.ticks, tasFlagged: r.verdict.tasFlagged,
@@ -501,7 +582,7 @@ const server = http.createServer((req, res) => {
           } catch (e) { /* skip bad file */ }
         }
       } catch (e) { /* no receipts dir yet */ }
-      send(200, { player: pubkey, day, periodSeconds: period, standings, receipts });
+      send(200, { player: pubkey, name: nameOf(pubkey), day, periodSeconds: period, standings, receipts });
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
   }
@@ -515,12 +596,27 @@ const server = http.createServer((req, res) => {
     // Sensors: each green/yellow/red; overall = worst; 503 on red so any dumb
     // monitor can page on status code alone.
     const sensors = {};
-    const POT_RENT = 5218392, CABS = 31;
+    const POT_RENT = 4399280, CABS = LIVE_CABS.length || 31;   // v5 DailyPot rent; live cabinets only
     if (chain) {
-      const ident = healthCache.arcade ? (healthCache.arcade.verifier === chain.kp.publicKey.toBase58() ? "green" : "red") : "yellow";
-      sensors.verifierIdentity = { status: ident, detail: healthCache.arcade ? `arcade.verifier ${healthCache.arcade.verifier.slice(0, 8)} vs signer ${chain.kp.publicKey.toBase58().slice(0, 8)}` : "not read yet" };
-      const periods = keyBal.lamports === null ? null : keyBal.lamports / (POT_RENT * CABS);
-      sensors.signerRunway = { status: periods === null ? "yellow" : periods < 1 ? "red" : periods < 2 ? "yellow" : "green", detail: periods === null ? "unknown" : `${periods.toFixed(2)} periods of pot rent (${(keyBal.lamports / 1e9).toFixed(3)} SOL)` };
+      const ident = healthCache.arcade ? (sameAddr(healthCache.arcade.verifier, chain.signer) ? "green" : "red") : "yellow";
+      sensors.verifierIdentity = { status: ident, detail: healthCache.arcade ? `arcade.verifier ${healthCache.arcade.verifier.slice(0, 8)} vs signer ${chain.signer.slice(0, 8)}` : "not read yet" };
+      // per-period signer burn: Solana = pot rent per live cabinet; EVM = a gas allowance per live cabinet (settles + batched submits)
+      // What one cabinet actually costs the house per period: its fixed legs (one settle
+      // + one house-add ≈ 300k gas) priced at the LIVE gas price, plus the house add itself.
+      // A flat wei constant was pessimistic by ~100x whenever gas was cheap.
+      const perCab = chain.kind === "evm"
+        ? (process.env.EVM_GAS_BUDGET_WEI_PER_CAB
+            ? parseInt(process.env.EVM_GAS_BUDGET_WEI_PER_CAB, 10)
+            : Math.round(300000 * ((healthCache.gas && healthCache.gas.gwei) || 0.05) * 1e9))
+        : POT_RENT;
+      const periods = keyBal.lamports === null ? null : keyBal.lamports / ((perCab + HOUSE_ADD) * CABS);
+      sensors.signerRunway = { status: periods === null ? "yellow" : periods < 1 ? "red" : periods < 2 ? "yellow" : "green", detail: periods === null ? "unknown" : `${periods.toFixed(2)} periods of ${chain.kind === "evm" ? "gas budget" : "pot rent"} (${chain.fmt(keyBal.lamports)} ${chain.unit.symbol}${HOUSE_ADD ? ", incl. house adds" : ""})` };
+      if (chain.kind === "evm" && healthCache.gas) {
+        // does the gas leg on one quarter cover the house's gas for that play? (batched submit ≈ 70k + settle/house-add amortised ≈ 30k)
+        const g = healthCache.gas; const spendPerPlay = 100000 * g.gwei * 1e9, incomePerPlay = g.quarter * g.gasBps / 10000;
+        const cov = spendPerPlay > 0 ? incomePerPlay / spendPerPlay : Infinity;
+        sensors.gasCoverage = { status: cov >= 2 ? "green" : cov >= 1 ? "yellow" : "red", detail: `gas leg ${g.gasBps} bps = ${chain.fmt(incomePerPlay)} per play vs ≈${chain.fmt(spendPerPlay)} gas at ${g.gwei.toFixed(3)} gwei (${cov === Infinity ? "∞" : cov.toFixed(1)}×)` };
+      }
       if (settle.enabled) {
         const up = Date.now() - STARTED_AT, age = settle.lastOk ? Date.now() - settle.lastOk : up;
         const every = Math.max(60, parseInt(process.env.SETTLE_INTERVAL_S || "300", 10)) * 1000;
@@ -537,7 +633,7 @@ const server = http.createServer((req, res) => {
       sensors,
       uptimeS: Math.round((Date.now() - STARTED_AT) / 1000),
       settle: settle.enabled ? { lastRun: settle.lastRun, lastOk: settle.lastOk, settled: settle.settled, opened: settle.opened || 0, pending: settle.pending, errors: settle.errors, lastSweepErrors: settle.lastSweepErrors, lastError: settle.lastError, lastOpenError: settle.lastOpenError } : "off",
-      signer: chain ? { pubkey: chain.kp.publicKey.toBase58(), lamports: keyBal.lamports, at: keyBal.at } : null,
+      signer: chain ? { pubkey: chain.signer, lamports: keyBal.lamports, at: keyBal.at } : null,
       games: Object.keys(GAMES).length,
       engines: ENGINE_HASH,
       verifierPubkey: KEYS.publicKey.export({ format: "der", type: "spki" }).toString("base64"),
@@ -575,7 +671,7 @@ const server = http.createServer((req, res) => {
       try { parsed = JSON.parse(body); }
       catch { return send(400, { error: "bad json" }); }
       if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return send(400, { error: "bad body" });
-      if (typeof parsed.creditId !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(parsed.creditId)) return send(422, { verified: false, reason: "bad creditId" });
+      if (typeof parsed.creditId !== "string" || !/^[A-Za-z0-9_-]{1,66}$/.test(parsed.creditId)) return send(422, { verified: false, reason: "bad creditId" });
       if (inFlight.has(parsed.creditId)) return send(409, { verified: false, reason: "that credit is already being verified" });
       inFlight.add(parsed.creditId);
       const _send = send; send = (code, obj) => { inFlight.delete(parsed.creditId); return _send(code, obj); };
@@ -631,6 +727,7 @@ const server = http.createServer((req, res) => {
 
 const PORT = process.env.PORT || 8791;
 if (require.main === module) {
-  server.listen(PORT, () => console.log(`quarters verifier on :${PORT}, receipts in ${RECEIPTS_DIR}`));
+  server.on("error", (e) => { console.error("listen failed: " + e.message + " — exiting so no port-less daemon keeps running"); process.exit(1); });
+server.listen(PORT, () => console.log(`quarters verifier on :${PORT}, receipts in ${RECEIPTS_DIR}`));
 }
 module.exports = { server, verifyRun, tasFlags };
