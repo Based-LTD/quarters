@@ -1,7 +1,9 @@
 name: uptime
-# Free watchdog: every 15 minutes, hit the verifier's /health. Fails (and
-# GitHub emails the repo owners) if the verifier is down, the settle sweep is
-# stale, settle errors accumulate, the signer key runs low, or the site is down.
+# Free watchdog: every 15 minutes, hit the Robinhood Chain verifier's /health.
+# /health rolls up its own sensors (verifier identity, signer gas runway, gas
+# coverage, settle-sweep freshness and errors, stale pots) into one status and
+# answers 503 on red. Fails (and GitHub emails the repo owners) on red, on an
+# unreachable verifier, or if the site is down. Yellow is logged, not failed.
 on:
   schedule:
     - cron: "*/15 * * * *"
@@ -13,21 +15,15 @@ jobs:
       - name: verifier health
         run: |
           set -e
-          out=$(curl -sf --max-time 20 https://quarters-verifier.fly.dev/health) || { echo "verifier DOWN"; exit 1; }
-          echo "$out"
+          out=$(curl -s --max-time 20 -w '\n%{http_code}' https://quarters-rh-mainnet.fly.dev/health) || { echo "verifier DOWN"; exit 1; }
+          code=$(printf '%s' "$out" | tail -n1); body=$(printf '%s' "$out" | sed '$d')
+          echo "$body"
           node -e '
-            const d = JSON.parse(process.argv[1]);
-            if (!d.ok) { console.log("health not ok"); process.exit(1); }
-            if (d.settle && d.settle !== "off") {
-              const up = (d.uptimeS || 0) * 1000;
-              const age = d.settle.lastOk ? Date.now() - d.settle.lastOk : up;
-              if (up > 30 * 60 * 1000 && age > 30 * 60 * 1000) { console.log("settle sweep stale: " + Math.round(age/60000) + " min"); process.exit(1); }
-              // rolling: only the last completed sweep counts (cumulative counters never clear)
-              if ((d.settle.lastSweepErrors || 0) > 0) { console.log("last sweep had errors: " + (d.settle.lastError || d.settle.lastOpenError)); process.exit(1); }
-            }
-            // the signer is a flow-through key: it pre-pays ~0.162 SOL of pot rent per period (31 cabinets); red below one period of runway
-            if (d.signer && d.signer.lamports !== null && d.signer.lamports < 0.17e9) { console.log("verifier signer runway < 1 period: " + (d.signer.lamports/1e9).toFixed(3) + " SOL — fund " + d.signer.pubkey); process.exit(1); }
-            console.log("ok: games=" + d.games + " settled=" + (d.settle && d.settle.settled) + " opened=" + (d.settle && d.settle.opened) + " signer=" + (d.signer && (d.signer.lamports/1e9).toFixed(3)));
-          ' "$out"
+            let d; try { d = JSON.parse(process.argv[1]); } catch (e) { console.log("health returned non-JSON"); process.exit(1); }
+            const off = Object.entries(d.sensors || {}).filter(([, v]) => v.status !== "green").map(([k, v]) => k + "=" + v.status + " (" + v.detail + ")");
+            console.log("status: " + d.status + (off.length ? " | " + off.join(" | ") : " | all sensors green"));
+            if (d.status === "red" || d.ok === false) process.exit(1);
+          ' "$body"
+          [ "$code" = "200" ] || { echo "verifier HTTP $code"; exit 1; }
       - name: site up
         run: curl -sf --max-time 20 -o /dev/null https://quarters.fun/ || { echo "site DOWN"; exit 1; }
