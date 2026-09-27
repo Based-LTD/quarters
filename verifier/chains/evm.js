@@ -62,7 +62,7 @@ function makeEvmChain({ rpcUrl, chainId, contract, privateKey, network, log = co
       if (!c || !c[6]) return null;   // [player, cabinet, day, insertedAt, salt, used, exists]
       return { id: key, player: c[0], cabinet: Number(c[1]), day: Number(c[2]), insertedAt: Number(c[3]), salt: c[4].slice(2), used: c[5], commit, rentPayer: null };
     },
-    potId: (cab, day) => `evm:${cab}:${day}`,
+    potId: (cab, day) => `evm:${address.toLowerCase()}:${cab}:${day}`,   // contract-scoped: a new deployment must not inherit the old one's books
     async pot(cab, day) {
       const p = await read("potOf", [cab, day]);   // [count, settled, exists, poolWei, entries]
       if (!p[2]) return null;

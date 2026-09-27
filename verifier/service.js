@@ -275,6 +275,15 @@ async function chainSubmit(creditId, body, result) {
       announceBounty(credit.player, result.score, b.record, b.pool);
       return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: credit.player, bounty: { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool } };
     }
+    // JACKPOT HOLD: a record over a big pool waits for a human look at the
+    // replay before it touches the chain. The contract only takes a score
+    // within SUBMIT_WINDOW of the coin, so the hold has a hard deadline and a
+    // default action (BOUNTY_HOLD_DEFAULT) if nobody decides in time.
+    if (isRecord && chain.bountyInSubmit && b.pool >= HOLD_WEI && credit.insertedAt) {
+      const h = await openHold(credit, sub, result, b);
+      return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: credit.player,
+        bounty: { held: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, poolLamports: b.pool } };
+    }
     if (isRecord) announceBounty(credit.player, result.score, b.record, b.pool);
     bountyNote = isRecord ? { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool }
       : { claimed: false, record: b.record, floor: b.floor || 0, bar, poolLamports: b.pool };
@@ -282,6 +291,118 @@ async function chainSubmit(creditId, body, result) {
   const { txSig, batched } = await chain.submit(credit.cabinet, sub);
   return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: credit.player, ...(bountyNote ? { bounty: bountyNote } : {}) };
 }
+// ---------- jackpot hold ----------
+const HOLD_WEI = Number(process.env.BOUNTY_HOLD_WEI || "100000000000000000");   // 0.1 ETH
+const HOLD_DEFAULT = process.env.BOUNTY_HOLD_DEFAULT === "flag" ? "flag" : "pay";  // if nobody decides in time
+const HOLD_SUBMIT_WINDOW_S = 1200;   // Quarters.SUBMIT_WINDOW
+const HOLD_MARGIN_S = parseInt(process.env.BOUNTY_HOLD_MARGIN_S || "90", 10);   // decide this long before the window closes, so the tx lands
+const HOLDS_DIR = process.env.HOLDS_DIR || path.join(RECEIPTS_DIR, "_holds");
+const SITE_URL = process.env.SITE_URL || "https://quarters.fun";
+const PUBLIC_URL = process.env.PUBLIC_URL || "https://quarters-rh-mainnet.fly.dev";
+fs.mkdirSync(HOLDS_DIR, { recursive: true });
+const holds = new Map(), holdTimers = new Map();
+function saveHold(h) { holds.set(h.id, h); fs.writeFileSync(path.join(HOLDS_DIR, h.id + ".json"), JSON.stringify(h, null, 1)); }
+function holdPublic(h) {
+  return { id: h.id, status: h.status, score: h.score, deadline: h.deadline, previousRecord: h.prevRecord, floor: h.floor,
+    poolWei: h.poolWei, paidWei: h.paidWei || 0, txSig: h.txSig || null, decidedBy: h.decidedBy || null };
+}
+async function openHold(credit, sub, result, b) {
+  // The window is measured in CHAIN time; the timer runs on this server's
+  // clock. Convert through the chain's current time so a skewed clock can't
+  // push the default action past the window.
+  let chainNow = Math.floor(Date.now() / 1000); try { chainNow = await chain.now(); } catch (e) {}
+  const secsLeft = credit.insertedAt + HOLD_SUBMIT_WINDOW_S - HOLD_MARGIN_S - chainNow;
+  const h = {
+    id: crypto.randomBytes(8).toString("hex"), token: crypto.randomBytes(16).toString("hex"), status: "pending",
+    createdAt: Date.now(), deadline: Math.floor(Date.now() / 1000) + secsLeft,   // unix seconds, server clock
+    cab: credit.cabinet, creditId: sub.creditId, player: credit.player, score: result.score,
+    prevRecord: b.record, floor: b.floor || 0, poolWei: b.pool, ticks: result.ticks,
+    tas: { flagged: !!result.tas.flagged, score: result.tas.score, signals: result.tas.signals },
+    playsToday: (walletVolume.get(credit.player) || {}).count || 0,
+    sub: { player: sub.player, secret: sub.secret, score: sub.score, replayHash: sub.replayHash.toString("hex"), flagged: !!sub.flagged },
+  };
+  saveHold(h); scheduleHold(h); notifyHold(h);
+  console.log(`hold ${h.id}: bounty record ${h.score} by ${h.player} over ${h.poolWei} wei, decide by ${new Date(h.deadline * 1000).toISOString()} (default ${HOLD_DEFAULT})`);
+  return h;
+}
+function scheduleHold(h) {
+  clearTimeout(holdTimers.get(h.id));
+  const ms = Math.max(0, h.deadline * 1000 - Date.now());
+  holdTimers.set(h.id, setTimeout(() => decideHold(h.id, HOLD_DEFAULT, "timeout").catch((e) => console.log("hold timeout error " + e.message)), ms));
+}
+function notifyHold(h) {
+  const topic = process.env.NTFY_TOPIC; if (!topic) { console.log(`hold ${h.id}: NTFY_TOPIC unset, no push`); return; }
+  const mins = Math.max(0, Math.round((h.deadline * 1000 - Date.now()) / 60000));
+  fetch("https://ntfy.sh/" + encodeURIComponent(topic), { method: "POST",
+    headers: { Title: "JACKPOT REVIEW: " + h.score + " for " + chain.fmt(h.poolWei) + " ETH", Priority: "urgent", Tags: "rotating_light",
+      Click: PUBLIC_URL + "/review/" + h.id + "?t=" + h.token },
+    body: "Beat " + Math.max(h.prevRecord, h.floor) + ". " + mins + " min to decide, then default: " + HOLD_DEFAULT.toUpperCase() + ". Tap to review." })
+    .catch((e) => console.log(`hold ${h.id}: push failed ${e.message}`));
+}
+async function decideHold(id, action, by) {
+  const h = holds.get(id); if (!h || h.status !== "pending") return h;
+  clearTimeout(holdTimers.get(id)); holdTimers.delete(id);
+  h.status = "submitting"; h.decidedBy = by; saveHold(h);
+  const flagged = action === "flag" || h.sub.flagged;
+  try {
+    const pre = await chain.bounty(h.cab);
+    const r = await chain.submit(h.cab, { player: h.sub.player, secret: h.sub.secret, score: h.sub.score, replayHash: Buffer.from(h.sub.replayHash, "hex"), flagged });
+    h.txSig = r.txSig;
+    if (!flagged) {
+      const post = await chain.bounty(h.cab);
+      const won = post.record === h.score && String(post.champion).toLowerCase() === String(h.player).toLowerCase();
+      h.paidWei = won ? pre.pool : 0;
+      if (won) announceBounty(h.player, h.score, pre.record, pre.pool);
+    }
+    h.status = flagged ? "rejected" : "approved";
+  } catch (e) { h.status = "failed"; h.error = String((e && e.message) || e).slice(0, 300); console.log(`hold ${id}: submit failed ${h.error}`); }
+  h.decidedAt = Date.now(); saveHold(h);
+  // the receipt's onchain block must say what actually happened, not "held"
+  try { const rp = path.join(RECEIPTS_DIR, h.creditId + ".json"); const rc = JSON.parse(fs.readFileSync(rp, "utf8"));
+    rc.onchain = { ...(rc.onchain || {}), hold: holdPublic(h), txSig: h.txSig || null }; fs.writeFileSync(rp, JSON.stringify(rc, null, 1)); } catch (e) {}
+  console.log(`hold ${id}: ${h.status} by ${by}${h.txSig ? " tx " + h.txSig : ""}${h.paidWei ? " paid " + h.paidWei : ""}`);
+  return h;
+}
+function restoreHolds() {
+  for (const f of fs.readdirSync(HOLDS_DIR).filter((n) => n.endsWith(".json"))) {
+    try { const h = JSON.parse(fs.readFileSync(path.join(HOLDS_DIR, f), "utf8")); holds.set(h.id, h);
+      if (h.status === "pending") scheduleHold(h);
+      if (h.status === "submitting") console.log(`hold ${h.id}: was mid-submit at restart — check tx and credit ${h.creditId} by hand`);
+    } catch (e) { console.log("hold restore: bad file " + f); }
+  }
+}
+function tokenOk(h, t) { const a = Buffer.from(String(h.token)), b = Buffer.from(String(t || "")); return a.length === b.length && crypto.timingSafeEqual(a, b); }
+function reviewPage(h, t) {
+  const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
+  const watch = (sp) => SITE_URL + "/voidrocks.html?watch=" + encodeURIComponent(h.creditId) + "&speed=" + sp;
+  const open = h.status === "pending";
+  return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jackpot review</title>
+<style>:root{color-scheme:dark}body{margin:0;background:#060708;color:#E9EDEF;font:15px/1.6 "IBM Plex Mono",Menlo,monospace;padding:20px 16px 40px}
+.w{max-width:520px;margin:0 auto}h1{font:700 22px/1.2 system-ui,sans-serif;letter-spacing:.06em;color:#E3B54A;margin:0 0 4px}
+.k{color:#8B949B;font-size:12px;letter-spacing:.14em}.big{font:800 44px/1 system-ui,sans-serif;color:#fff;margin:14px 0 2px;font-variant-numeric:tabular-nums}
+.row{display:flex;justify-content:space-between;border-bottom:1px solid #22262b;padding:9px 0;gap:12px}.row b{font-weight:500;text-align:right}
+.clock{font:700 28px system-ui,sans-serif;color:#E3B54A;font-variant-numeric:tabular-nums}.flag{color:#E8402F}
+a.w8,button{display:block;width:100%;box-sizing:border-box;text-align:center;padding:15px;border-radius:6px;font:600 15px system-ui,sans-serif;letter-spacing:.08em;margin-top:10px;cursor:pointer;text-decoration:none}
+a.w8{border:1px solid #E3B54A;color:#E3B54A}.pay{background:#3DD8A8;color:#04110c;border:0}.no{background:transparent;color:#E8402F;border:1px solid #E8402F}
+.st{margin-top:18px;padding:12px;border-radius:6px;background:#14171B}</style></head><body><div class="w">
+<h1>JACKPOT REVIEW</h1><div class="k">THE BOUNTY · CABINET #${esc(h.cab)} · HOLD ${esc(h.id)}</div>
+<div class="big">${esc(h.score.toLocaleString("en-US"))}</div><div class="k">BEATS ${esc(Math.max(h.prevRecord, h.floor).toLocaleString("en-US"))} · POOL ${esc(chain.fmt(h.poolWei))} ETH</div>
+${open ? `<div class="st"><div class="k">TIME TO DECIDE, THEN AUTO-${esc(HOLD_DEFAULT.toUpperCase())}</div><div class="clock" id="c">—</div></div>` : `<div class="st">Decided: <b>${esc(h.status.toUpperCase())}</b> by ${esc(h.decidedBy || "?")}${h.txSig ? `<br><span class="k">tx ${esc(h.txSig)}</span>` : ""}${h.error ? `<br><span class="flag">${esc(h.error)}</span>` : ""}</div>`}
+<div class="row"><span>player</span><b>${esc(h.player.slice(0, 8))}…${esc(h.player.slice(-6))}</b></div>
+<div class="row"><span>plays today (this wallet)</span><b>${esc(h.playsToday)}</b></div>
+<div class="row"><span>run length</span><b>${esc(Math.round(h.ticks / 60))}s</b></div>
+<div class="row"><span>bot-timing check</span><b class="${h.tas.flagged ? "flag" : ""}">${h.tas.flagged ? "FLAGGED" : "passed"} · score ${esc(h.tas.score)}</b></div>
+${(h.tas.signals || []).length ? `<div class="row"><span>signals</span><b>${esc((h.tas.signals || []).join(", "))}</b></div>` : ""}
+<a class="w8" href="${esc(watch(8))}" target="_blank" rel="noopener">WATCH REPLAY · 8×</a>
+<a class="w8" href="${esc(watch(16))}" target="_blank" rel="noopener">WATCH REPLAY · 16×</a>
+${open ? `<form method="post" action="/review/${esc(h.id)}/approve?t=${esc(t)}"><button class="pay">APPROVE · PAY THE POOL</button></form>
+<form method="post" action="/review/${esc(h.id)}/reject?t=${esc(t)}" onsubmit="return confirm('Reject? The run goes on the board flagged and the pool stays.')"><button class="no">REJECT · KEEP THE POOL</button></form>
+<script>const d=${Number(h.deadline) * 1000},c=document.getElementById("c");(function t(){const s=Math.max(0,Math.round((d-Date.now())/1000));c.textContent=Math.floor(s/60)+":"+String(s%60).padStart(2,"0");if(s>0)setTimeout(t,1000);else setTimeout(()=>location.reload(),4000)})();</script>` : ""}
+</div></body></html>`;
+}
+
+if (chain) restoreHolds();   // after the declarations above: pending holds get their deadline timers back
+
 function announceBounty(player, score, prevRecord, pool) {
   if (!(pool > 0)) return;   // a record over an empty pool is not "took the whole pool: 0"
   try {
@@ -502,16 +623,24 @@ const server = http.createServer((req, res) => {
       const day = Math.floor((await chain.now()) / period);
       const CABS = Array.from({ length: 31 }, (_, i) => i + 1).filter(isLive);
       const boards = [];
+      // Every live cabinet that exists on this arcade gets a board, played today
+      // or not: an empty table is an open seat, not a missing machine.
       await Promise.all(CABS.map(async (cab) => {
-        try {
-          const pot = await chain.pot(cab, day); if (!pot) return;
-          const entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged })).sort((a, b) => b.score - a.score);
-          const ha = houseAdds[chain.potId(cab, day)];
-          boards.push({ cabinetId: cab, potLamports: pot.balance, poolLamports: pot.pool, houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 3) });
-        } catch (e) { /* no pot */ }
+        let info = null; try { info = await cabinetInfo(cab); } catch (e) {}
+        if (!info) return;
+        let pot = null; try { pot = await chain.pot(cab, day); } catch (e) { /* no pot yet */ }
+        const entries = pot ? pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged })).sort((a, b) => b.score - a.score) : [];
+        const ha = houseAdds[chain.potId(cab, day)];
+        const board = { cabinetId: cab, game: info.game, priceLamports: info.price || cfg.quarter || 0, potLamports: pot ? pot.balance : 0, poolLamports: pot ? pot.pool : 0,
+          houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 10) };
+        if (info.isBounty) {
+          try { const bb = await chain.bounty(cab); board.bounty = { record: bb.record, floor: bb.floor || 0, bar: bb.bar != null ? bb.bar : bb.record, lamports: bb.pool, champion: bb.champion, championName: nameOf(bb.champion) }; } catch (e) {}
+        }
+        boards.push(board);
       }));
-      boards.sort((a, b) => b.poolLamports - a.poolLamports);
-      readCache.lb = { at: Date.now(), body: { day, periodSeconds: period, unit: chain.unit, boards } };
+      boards.sort((a, b) => b.poolLamports - a.poolLamports || b.count - a.count || a.cabinetId - b.cabinetId);
+      // pots settle once the period is over (plus the contract's grace window)
+      readCache.lb = { at: Date.now(), body: { day, periodSeconds: period, unit: chain.unit, payoutAt: (day + 1) * period, boards } };
       send(200, readCache.lb.body);
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
@@ -649,6 +778,21 @@ const server = http.createServer((req, res) => {
     return res.end(fs.readFileSync(p));
   }
 
+  // Jackpot hold: public status for the waiting player; review + decide behind the per-hold token.
+  { const m = req.url.match(/^\/hold\/([0-9a-f]{16})$/);
+    if (req.method === "GET" && m) { const h = holds.get(m[1]); return h ? send(200, holdPublic(h)) : send(404, { error: "no such hold" }); } }
+  { const m = req.url.match(/^\/review\/([0-9a-f]{16})(\/(approve|reject))?\?t=([0-9a-f]{1,64})$/);
+    if (m) {
+      const h = holds.get(m[1]);
+      if (!h || !tokenOk(h, m[4])) return send(404, { error: "no such review" });
+      if (req.method === "GET" && !m[3]) { res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store" }); return res.end(reviewPage(h, m[4])); }
+      if (req.method === "POST" && m[3]) {
+        decideHold(h.id, m[3] === "approve" ? "pay" : "flag", "human")
+          .then(() => { res.writeHead(303, { location: "/review/" + h.id + "?t=" + m[4] }); res.end(); })
+          .catch((e) => send(500, { error: String(e.message || e) }));
+        return;
+      }
+    } }
   if (req.method === "POST" && req.url === "/submit") {
     // Abuse limits: a full 10-minute run RLE-encodes to a few KB, so 1 MB is
     // generous; 30 submits/minute/IP is far above any human; one in-flight

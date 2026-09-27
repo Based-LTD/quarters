@@ -64,7 +64,7 @@ It loads the engine, replays the recorded inputs against the committed seed, and
 Public verifier endpoints:
 
 ```
-GET /leaderboards               every cabinet's pot and top three, this period
+GET /leaderboards               every live cabinet's pot and top ten, the bounty, and the next payout time
 GET /leaderboard/:cabinetId     one cabinet, straight from the chain (incl. bounty record, floor, pool)
 GET /replays/:creditId.json     a receipt
 GET /stats                      totals
