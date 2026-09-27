@@ -123,6 +123,25 @@ if (process.env.CHAIN === "evm") {
   const keyJson = process.env.VERIFIER_SOLANA_KEY ? JSON.parse(process.env.VERIFIER_SOLANA_KEY) : JSON.parse(fs.readFileSync(path.join(__dirname, "verifier-solana-devnet.json")));
   chain = require("./chains/solana.js")({ rpcUrl: process.env.RPC_URL || "https://api.devnet.solana.com", keyJson, programId: process.env.PROGRAM_ID, network: process.env.QR_NETWORK || "devnet" });
 }
+// THE BOUNTY rotates (verifier/jackpot.js): cabinet 2 runs the game of the week
+// from the public jackpot-schedule.json, scored in jackpot points on-chain.
+const JACKPOT_SCHEDULE = process.env.JACKPOT_SCHEDULE || path.join(__dirname, "jackpot-schedule.json");
+const jackpot = chain && chain.kind === "evm" && fs.existsSync(JACKPOT_SCHEDULE)
+  ? require("./jackpot.js")({ chain, cab: 2, scheduleFile: JACKPOT_SCHEDULE, stateFile: path.join(RECEIPTS_DIR, "_jackpot.json") }) : null;
+let jackpotPublic = null;   // the health sensor reads this; it also opens each week's rate as soon as the week is ready
+if (jackpot) { const tickJ = () => jackpot.publicState(Math.floor(Date.now() / 1000)).then((j) => { jackpotPublic = j; }).catch(() => {}); setTimeout(tickJ, 3000); setInterval(tickJ, 60000); }
+const GAME_TITLES = { voidrocks: "VOID ROCKS", coil: "COIL", breakpoint: "BREAKPOINT", moth: "MOTH", lander: "LANDER", chomp: "CHOMP", girder: "GIRDER", stack: "STACK", apex: "APEX" };
+const gameTitle = (g) => GAME_TITLES[g] || String(g || "").toUpperCase();
+// Cabinet 2's on-chain scores are jackpot points; boards show the raw game score.
+const shownScore = (cab, e) => { if (!jackpot || cab !== 2) return e.score; const r = jackpot.rawFor(e.replayHash); return r != null ? r : e.score; };
+async function bountyView(b) {
+  const v = { record: b.record, floor: b.floor || 0, bar: b.bar != null ? b.bar : b.record, champion: b.champion, lamports: b.pool, championName: nameOf(b.champion) };
+  if (jackpot) {
+    try { const j = await jackpot.publicState(Math.floor(Date.now() / 1000));
+      if (j) Object.assign(v, { game: j.game, target: j.target, barRaw: j.barRaw, weekRecordRaw: j.weekRecordRaw, rotatesAt: j.rotatesAt, next: j.next, paused: j.paused }); } catch (e) {}
+  }
+  return v;
+}
 const cabinetCache = new Map();   // cab → { game, operator, isBounty }
 async function cabinetInfo(cab) { if (cabinetCache.has(cab)) return cabinetCache.get(cab); const c = await chain.cabinet(cab); if (c) cabinetCache.set(cab, c); return c; }
 const sameAddr = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
@@ -250,7 +269,16 @@ async function chainSubmit(creditId, body, result) {
   // engine must not be able to land in another cabinet's pot.
   const cab = await cabinetInfo(credit.cabinet);
   if (!cab) return { ok: false, code: 502, reason: "cabinet lookup failed" };
-  if (cab.game !== body.game) return { ok: false, code: 422, reason: `credit is for ${cab.game}, not ${body.game}` };
+  // THE BOUNTY rotates: cabinet 2 plays the game of the week its coin went in.
+  const jw = cab.isBounty && jackpot ? jackpot.weekAt(credit.insertedAt) : null;
+  const wantGame = jw ? jw.game : cab.game;
+  if (wantGame !== body.game) return { ok: false, code: 422, reason: `credit is for ${wantGame}, not ${body.game}` };
+  let jst = null;
+  if (jw) {
+    jst = await jackpot.rate(jw);
+    // 503 on purpose: the client keeps the run and retries until the owner opens the week
+    if (!jst) return { ok: false, code: 503, reason: "THE BOUNTY is rotating to " + gameTitle(jw.game) + ". Your run is saved and lands as soon as the new week opens." };
+  }
   // Per-wallet volume this period feeds the behavior analysis.
   { const w = credit.player; const v = walletVolume.get(w); const dayNow = credit.day;
     const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
@@ -260,7 +288,9 @@ async function chainSubmit(creditId, body, result) {
   if (credit.commit && !commit.equals(credit.commit)) return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
   if (credit.salt !== String(body.salt).toLowerCase()) return { ok: false, code: 422, reason: "salt does not match the credit" };
   const replayHash = crypto.createHash("sha256").update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE })).digest();
-  const sub = { creditId, credit, player: credit.player, secret: body.secret, score: result.score, replayHash, flagged: !!result.tas.flagged };
+  const sub = { creditId, credit, player: credit.player, secret: body.secret, score: jst ? jackpot.toPoints(result.score, jst) : result.score, replayHash, flagged: !!result.tas.flagged };
+  if (jst) jackpot.noteRaw(replayHash.toString("hex"), result.score);
+  const jInfo = jw ? { jackpot: { week: jw.from, game: jw.game, raw: result.score, points: sub.score, num: jst.num, den: jst.den } } : {};
   // Bounty cabinet: an unflagged record takes the whole pool. A flagged record
   // is held like any other flagged run — it goes on the board, nothing pays.
   let bountyNote;
@@ -269,27 +299,31 @@ async function chainSubmit(creditId, body, result) {
     // bar = max(record, floor): the contract pays nothing below its floor, so
     // neither do we claim, announce, or tell the player they won.
     const bar = b.bar != null ? b.bar : b.record;
-    const isRecord = result.score > bar && !sub.flagged;
+    const isRecord = sub.score > bar && !sub.flagged;   // points against the on-chain bar
+    const prevRaw = jst ? jackpot.barRaw(jw, jst) : bar;   // the raw score the player sees they beat
     if (isRecord && !chain.bountyInSubmit) {
       const { txSig } = await chain.claimBounty(credit.cabinet, sub);
-      announceBounty(credit.player, result.score, b.record, b.pool);
-      return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: credit.player, bounty: { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool } };
+      announceBounty(credit.player, result.score, prevRaw, b.pool, wantGame);
+      return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: credit.player, bounty: { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: b.pool } };
     }
     // JACKPOT HOLD: a record over a big pool waits for a human look at the
     // replay before it touches the chain. The contract only takes a score
     // within SUBMIT_WINDOW of the coin, so the hold has a hard deadline and a
     // default action (BOUNTY_HOLD_DEFAULT) if nobody decides in time.
     if (isRecord && chain.bountyInSubmit && b.pool >= HOLD_WEI && credit.insertedAt) {
-      const h = await openHold(credit, sub, result, b);
-      return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: credit.player,
-        bounty: { held: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, poolLamports: b.pool } };
+      const h = await openHold(credit, sub, result, b, { prevRaw, game: wantGame, weekFrom: jw ? jw.from : null });
+      return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: credit.player, ...jInfo,
+        bounty: { held: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, poolLamports: b.pool } };
     }
-    if (isRecord) announceBounty(credit.player, result.score, b.record, b.pool);
-    bountyNote = isRecord ? { claimed: true, previousRecord: b.record, floor: b.floor || 0, newRecord: result.score, paidLamports: b.pool }
-      : { claimed: false, record: b.record, floor: b.floor || 0, bar, poolLamports: b.pool };
+    if (isRecord) announceBounty(credit.player, result.score, prevRaw, b.pool, wantGame);
+    bountyNote = isRecord ? { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: b.pool }
+      : { claimed: false, record: prevRaw, floor: 0, bar: prevRaw, poolLamports: b.pool };
   }
   const { txSig, batched } = await chain.submit(credit.cabinet, sub);
-  return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: credit.player, ...(bountyNote ? { bounty: bountyNote } : {}) };
+  if (jw && bountyNote && bountyNote.claimed) {   // the week's raw record moves only once the chain agrees
+    try { const post = await chain.bounty(credit.cabinet); if (post.record === sub.score && sameAddr(post.champion, credit.player)) jackpot.noteWin(jw, result.score); } catch (e) {}
+  }
+  return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: credit.player, ...jInfo, ...(bountyNote ? { bounty: bountyNote } : {}) };
 }
 // ---------- jackpot hold ----------
 const HOLD_WEI = Number(process.env.BOUNTY_HOLD_WEI || "100000000000000000");   // 0.1 ETH
@@ -306,7 +340,7 @@ function holdPublic(h) {
   return { id: h.id, status: h.status, score: h.score, deadline: h.deadline, previousRecord: h.prevRecord, floor: h.floor,
     poolWei: h.poolWei, paidWei: h.paidWei || 0, txSig: h.txSig || null, decidedBy: h.decidedBy || null };
 }
-async function openHold(credit, sub, result, b) {
+async function openHold(credit, sub, result, b, extra = {}) {
   // The window is measured in CHAIN time; the timer runs on this server's
   // clock. Convert through the chain's current time so a skewed clock can't
   // push the default action past the window.
@@ -316,7 +350,8 @@ async function openHold(credit, sub, result, b) {
     id: crypto.randomBytes(8).toString("hex"), token: crypto.randomBytes(16).toString("hex"), status: "pending",
     createdAt: Date.now(), deadline: Math.floor(Date.now() / 1000) + secsLeft,   // unix seconds, server clock
     cab: credit.cabinet, creditId: sub.creditId, player: credit.player, score: result.score,
-    prevRecord: b.record, floor: b.floor || 0, poolWei: b.pool, ticks: result.ticks,
+    prevRecord: extra.prevRaw != null ? extra.prevRaw : b.record, floor: extra.prevRaw != null ? 0 : (b.floor || 0), poolWei: b.pool, ticks: result.ticks,
+    game: extra.game || "voidrocks", weekFrom: extra.weekFrom || null,
     tas: { flagged: !!result.tas.flagged, score: result.tas.score, signals: result.tas.signals },
     playsToday: (walletVolume.get(credit.player) || {}).count || 0,
     sub: { player: sub.player, secret: sub.secret, score: sub.score, replayHash: sub.replayHash.toString("hex"), flagged: !!sub.flagged },
@@ -350,9 +385,10 @@ async function decideHold(id, action, by) {
     h.txSig = r.txSig;
     if (!flagged) {
       const post = await chain.bounty(h.cab);
-      const won = post.record === h.score && String(post.champion).toLowerCase() === String(h.player).toLowerCase();
+      const won = post.record === h.sub.score && String(post.champion).toLowerCase() === String(h.player).toLowerCase();   // on-chain score is points
       h.paidWei = won ? pre.pool : 0;
-      if (won) announceBounty(h.player, h.score, pre.record, pre.pool);
+      if (won && jackpot && h.weekFrom) jackpot.noteWin({ from: h.weekFrom }, h.score);
+      if (won) announceBounty(h.player, h.score, h.prevRecord, pre.pool, h.game);
     }
     h.status = flagged ? "rejected" : "approved";
   } catch (e) { h.status = "failed"; h.error = String((e && e.message) || e).slice(0, 300); console.log(`hold ${id}: submit failed ${h.error}`); }
@@ -374,7 +410,7 @@ function restoreHolds() {
 function tokenOk(h, t) { const a = Buffer.from(String(h.token)), b = Buffer.from(String(t || "")); return a.length === b.length && crypto.timingSafeEqual(a, b); }
 function reviewPage(h, t) {
   const esc = (x) => String(x).replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" })[c]);
-  const watch = (sp) => SITE_URL + "/voidrocks.html?watch=" + encodeURIComponent(h.creditId) + "&speed=" + sp;
+  const watch = (sp) => SITE_URL + "/" + (h.game || "voidrocks") + ".html?watch=" + encodeURIComponent(h.creditId) + "&speed=" + sp;
   const open = h.status === "pending";
   return `<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Jackpot review</title>
 <style>:root{color-scheme:dark}body{margin:0;background:#060708;color:#E9EDEF;font:15px/1.6 "IBM Plex Mono",Menlo,monospace;padding:20px 16px 40px}
@@ -385,7 +421,7 @@ function reviewPage(h, t) {
 a.w8,button{display:block;width:100%;box-sizing:border-box;text-align:center;padding:15px;border-radius:6px;font:600 15px system-ui,sans-serif;letter-spacing:.08em;margin-top:10px;cursor:pointer;text-decoration:none}
 a.w8{border:1px solid #E3B54A;color:#E3B54A}.pay{background:#3DD8A8;color:#04110c;border:0}.no{background:transparent;color:#E8402F;border:1px solid #E8402F}
 .st{margin-top:18px;padding:12px;border-radius:6px;background:#14171B}</style></head><body><div class="w">
-<h1>JACKPOT REVIEW</h1><div class="k">THE BOUNTY · CABINET #${esc(h.cab)} · HOLD ${esc(h.id)}</div>
+<h1>JACKPOT REVIEW</h1><div class="k">THE BOUNTY · ${esc(gameTitle(h.game))} · HOLD ${esc(h.id)}</div>
 <div class="big">${esc(h.score.toLocaleString("en-US"))}</div><div class="k">BEATS ${esc(Math.max(h.prevRecord, h.floor).toLocaleString("en-US"))} · POOL ${esc(chain.fmt(h.poolWei))} ETH</div>
 ${open ? `<div class="st"><div class="k">TIME TO DECIDE, THEN AUTO-${esc(HOLD_DEFAULT.toUpperCase())}</div><div class="clock" id="c">—</div></div>` : `<div class="st">Decided: <b>${esc(h.status.toUpperCase())}</b> by ${esc(h.decidedBy || "?")}${h.txSig ? `<br><span class="k">tx ${esc(h.txSig)}</span>` : ""}${h.error ? `<br><span class="flag">${esc(h.error)}</span>` : ""}</div>`}
 <div class="row"><span>player</span><b>${esc(h.player.slice(0, 8))}…${esc(h.player.slice(-6))}</b></div>
@@ -403,11 +439,11 @@ ${open ? `<form method="post" action="/review/${esc(h.id)}/approve?t=${esc(t)}">
 
 if (chain) restoreHolds();   // after the declarations above: pending holds get their deadline timers back
 
-function announceBounty(player, score, prevRecord, pool) {
+function announceBounty(player, score, prevRecord, pool, game) {
   if (!(pool > 0)) return;   // a record over an empty pool is not "took the whole pool: 0"
   try {
     const who = nameOf(player) || (player.slice(0, 4) + "…" + player.slice(-4));
-    poster.queue("bounty", "bounty:" + score + ":" + Date.now(), "THE BOUNTY just fell.\n\n" + who + " scored " + score + " on VOID ROCKS, beat the record of " + prevRecord + " and took the whole pool: " + chain.fmt(pool) + " " + chain.unit.symbol + ".\n\nNew record to beat: " + score + ". quarters.fun", null).catch(() => {});
+    poster.queue("bounty", "bounty:" + score + ":" + Date.now(), "THE BOUNTY just fell.\n\n" + who + " scored " + score + " on " + gameTitle(game || "voidrocks") + ", beat the record of " + prevRecord + " and took the whole pool: " + chain.fmt(pool) + " " + chain.unit.symbol + ".\n\nNew record to beat: " + score + ". quarters.fun", null).catch(() => {});
   } catch (e) {}
 }
 
@@ -615,6 +651,16 @@ const server = http.createServer((req, res) => {
     return;
   }
   // Current pot standings + bounty for a cabinet, straight off the chain.
+  // THE BOUNTY this week: game, raw score to beat, pool, rotation time, the next week if published.
+  if (req.method === "GET" && req.url === "/jackpot") {
+    if (!jackpot) return send(404, { error: "no rotation on this arcade" });
+    (async () => {
+      const j = await jackpot.publicState(Math.floor(Date.now() / 1000)); if (!j) return send(404, { error: "no week scheduled" });
+      const b = await chain.bounty(2);
+      send(200, { ...j, title: gameTitle(j.game), poolLamports: b.pool, recordPoints: b.record, unit: chain.unit, schedule: jackpot.schedule().map((w) => ({ from: w.from, game: w.game, target: w.target })) });
+    })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
+    return;
+  }
   if (req.method === "GET" && req.url === "/leaderboards") {
     if (!chain) return send(503, { error: "chain mode off" });
     if (readCache.lb && Date.now() - readCache.lb.at < 8000) return send(200, readCache.lb.body);
@@ -629,12 +675,12 @@ const server = http.createServer((req, res) => {
         let info = null; try { info = await cabinetInfo(cab); } catch (e) {}
         if (!info) return;
         let pot = null; try { pot = await chain.pot(cab, day); } catch (e) { /* no pot yet */ }
-        const entries = pot ? pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged })).sort((a, b) => b.score - a.score) : [];
+        const entries = pot ? pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: shownScore(cab, e), flagged: e.flagged })).sort((a, b) => b.score - a.score) : [];
         const ha = houseAdds[chain.potId(cab, day)];
         const board = { cabinetId: cab, game: info.game, priceLamports: info.price || cfg.quarter || 0, potLamports: pot ? pot.balance : 0, poolLamports: pot ? pot.pool : 0,
           houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 10) };
         if (info.isBounty) {
-          try { const bb = await chain.bounty(cab); board.bounty = { record: bb.record, floor: bb.floor || 0, bar: bb.bar != null ? bb.bar : bb.record, lamports: bb.pool, champion: bb.champion, championName: nameOf(bb.champion) }; } catch (e) {}
+          try { board.bounty = await bountyView(await chain.bounty(cab)); if (board.bounty.game) board.game = board.bounty.game; } catch (e) {}
         }
         boards.push(board);
       }));
@@ -656,7 +702,7 @@ const server = http.createServer((req, res) => {
       try {
         const pot = await chain.pot(cabId, day);
         if (pot) {
-          entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: e.score, replayHash: e.replayHash, flagged: e.flagged }));
+          entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: shownScore(cabId, e), replayHash: e.replayHash, flagged: e.flagged }));
           potLamports = pot.balance; poolLamports = pot.pool;
           const ha = houseAdds[chain.potId(cabId, day)]; houseAdd = ha ? ha.lamports : 0;
         }
@@ -664,7 +710,7 @@ const server = http.createServer((req, res) => {
       let bounty = null;
       try {
         const cab = await cabinetInfo(cabId);
-        if (cab && cab.isBounty) { const b = await chain.bounty(cabId); bounty = { record: b.record, floor: b.floor || 0, bar: b.bar != null ? b.bar : b.record, champion: b.champion, lamports: b.pool }; }
+        if (cab && cab.isBounty) bounty = await bountyView(await chain.bounty(cabId));
       } catch (e) { /* no bounty */ }
       if (bounty && bounty.champion) bounty.championName = nameOf(bounty.champion);
       let sponsor = null; if (chain.kind === "evm") { try { const sp = await chain.sponsor(cabId); if (sp) sponsor = { token: sp.token, buybackBps: sp.buybackBps, accruedWei: await chain.buybackAccrued(cabId), lastBuyback: buybacks.filter((b) => b.cab === cabId).slice(-1)[0] || null }; } catch (e) {} }
@@ -687,7 +733,7 @@ const server = http.createServer((req, res) => {
       for (const entry of pots) {
         if (!entry) continue;
         const [cab, pot] = entry;
-        const sorted = pot.entries.map((e) => ({ player: e.player, score: e.score })).sort((a, b) => b.score - a.score);
+        const sorted = pot.entries.map((e) => ({ player: e.player, score: shownScore(cab, e) })).sort((a, b) => b.score - a.score);
         sorted.forEach((e, rank) => { if (sameAddr(e.player, pubkey)) standings.push({ cabinetId: cab, rank: rank + 1, score: e.score, of: sorted.length }); });
       }
       // Receipts: newest 200 files, matched by player.
@@ -752,6 +798,18 @@ const server = http.createServer((req, res) => {
         sensors.sweepFreshness = { status: up < 2 * every ? "green" : age < 2 * every ? "green" : age < 6 * every ? "yellow" : "red", detail: `last ok ${Math.round(age / 1000)}s ago` };
         sensors.sweepErrors = { status: settle.lastSweepErrors > 0 ? "yellow" : "green", detail: settle.lastSweepErrors > 0 ? (settle.lastError || settle.lastOpenError || "") : "clean" };
         sensors.stalePots = { status: settle.pending > 3 ? "red" : settle.pending > 0 ? "yellow" : "green", detail: `${settle.pending} unsettled past grace` };
+        if (jackpot) {
+          try {
+            const nowS = Math.floor(Date.now() / 1000), j = jackpotPublic;   // refreshed every minute below
+            if (j) {
+              const age = nowS - Math.floor(Date.parse(j.from) / 1000);
+              // paused = the owner hasn't raised bountyFloor(2) to the new week's target yet; paid Bounty runs wait
+              sensors.jackpot = j.paused ? { status: age < 1800 ? "yellow" : "red", detail: `rotation to ${gameTitle(j.game)} pending: raise bountyFloor(2) to ${j.target}` }
+                : !j.next && age > 6 * 86400 ? { status: "yellow", detail: `${gameTitle(j.game)} week, day ${Math.floor(age / 86400) + 1}: publish next week's game` }
+                : { status: "green", detail: `${gameTitle(j.game)} · beat ${j.barRaw}${j.next ? " · then " + gameTitle(j.next.game) + " from " + j.next.from.slice(0, 10) : ""}` };
+            }
+          } catch (e) { sensors.jackpot = { status: "yellow", detail: "rotation state unreadable: " + String(e.message || e).slice(0, 80) }; }
+        }
       }
     }
     const rank = { green: 0, yellow: 1, red: 2 };

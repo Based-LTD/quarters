@@ -36,7 +36,9 @@ A payout that a recipient contract refuses is not lost: it accrues to `owed[addr
 
 ## THE BOUNTY
 
-Cabinet 2 is VOID ROCKS with no daily reset. Its pot share accrues to a standing pool. The first unflagged score above **max(current record, floor)** takes the whole pool, paid inside the same `submitScores` call that records the score. The floor is 50,000 (`bountyFloor(2)`). A run is capped at 10 minutes of play.
+Cabinet 2 is the jackpot machine. It runs **one game per week**, rotating Monday 00:00 UTC, from the append-only schedule in [`verifier/jackpot-schedule.json`](verifier/jackpot-schedule.json): an entry is published before its week starts and never edited after. The contract keeps one record for cabinet 2 in *jackpot points*; each week converts raw scores at a rate fixed when the week opens (`points = floor(raw × bar_at_open / target)`, see [`verifier/jackpot.js`](verifier/jackpot.js)), and every receipt carries the raw score, the points and the rate. The contract never reads which game a cabinet runs; the verifier enforces the week's game.
+
+Before rotation, cabinet 2 was VOID ROCKS with no daily reset. Its pot share accrues to a standing pool. The first unflagged score above **max(current record, floor)** takes the whole pool, paid inside the same `submitScores` call that records the score. The floor is 50,000 (`bountyFloor(2)`). A run is capped at 10 minutes of play.
 
 ## How a score becomes true
 
@@ -66,6 +68,7 @@ Public verifier endpoints:
 ```
 GET /leaderboards               every live cabinet's pot and top ten, the bounty, and the next payout time
 GET /leaderboard/:cabinetId     one cabinet, straight from the chain (incl. bounty record, floor, pool)
+GET /player/:wallet             a wallet's standings and receipts
 GET /replays/:creditId.json     a receipt
 GET /stats                      totals
 GET /health                     solvency, signer identity, gas runway, settlement freshness

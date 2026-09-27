@@ -1,0 +1,6 @@
+{
+  "_rules": "THE BOUNTY (cabinet 2) runs one game per week. Weeks start Monday 00:00 UTC. An entry is published in this public file before its week starts and is never edited after. A run counts under the week its coin was inserted in. target = the raw score to beat when the week opens.",
+  "weeks": [
+    { "from": "2026-09-26T00:00:00Z", "game": "voidrocks", "target": 50000 }
+  ]
+}
