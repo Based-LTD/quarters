@@ -77,6 +77,23 @@ function makeEvmChain({ rpcUrl, chainId, contract, privateKey, network, log = co
     },
     // floor: the contract's minimum winning score (contracts before bountyFloor have none).
     // bar = what a run must BEAT to pay — the same max() the contract applies in _submit.
+    // Bounty fee feed backstop: what a Proof fee splitter owes our forwarder, and a
+    // permissionless crank (claim the leg's share, forward it to the BountyFeeder).
+    async forwarderPending(forwarder, splitter) {
+      const ab = parseAbi(["function legOwed(address,address) view returns (uint256)"]);
+      const [owed, held] = await Promise.all([
+        pub.readContract({ address: getAddress(splitter), abi: ab, functionName: "legOwed", args: [getAddress(forwarder), "0x0000000000000000000000000000000000000000"] }).catch(() => 0n),
+        pub.getBalance({ address: getAddress(forwarder) }),
+      ]);
+      return { owed: Number(owed), held: Number(held) };
+    },
+    async crankForwarder(forwarder, splitter) {
+      const ab = parseAbi(["function crank(address splitter)"]);
+      const hash = await serial(() => wallet.writeContract({ address: getAddress(forwarder), abi: ab, functionName: "crank", args: [getAddress(splitter)] }));
+      const rc = await pub.waitForTransactionReceipt({ hash, timeout: 60000 });
+      if (rc.status !== "success") throw new Error("crank reverted " + hash);
+      return hash;
+    },
     // on-chain activity for the reviewer: how many transactions this wallet has ever sent, and its balance
     async walletFacts(addr) {
       const a = getAddress(addr);

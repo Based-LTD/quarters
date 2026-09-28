@@ -168,6 +168,26 @@ if (JACKPOT_DOOR && chain) setInterval(async () => {
   }
 }, 60000);
 const shownPlayer = (cab, e) => (jackpot && cab === 2 ? jackpot.playerFor(e.replayHash) || e.player : e.player);
+// Bounty fee feed backstop. Proof's keeper normally cranks our forwarder; if fees
+// sit undelivered, the verifier cranks it itself (permissionless, a few cents of gas).
+const BOUNTY_FORWARDER = /^0x[0-9a-fA-F]{40}$/.test(process.env.BOUNTY_FORWARDER || "") ? process.env.BOUNTY_FORWARDER : null;
+const BOUNTY_SPLITTER = /^0x[0-9a-fA-F]{40}$/.test(process.env.BOUNTY_SPLITTER || "") ? process.env.BOUNTY_SPLITTER : null;
+const FEED_MIN_WEI = Number(process.env.BOUNTY_FEED_MIN_WEI || "500000000000000");   // 0.0005 ETH: below that, gas isn't worth it
+const feedState = { lastCheck: null, pendingSince: null, pendingWei: 0, lastCrank: null, lastError: null, cranks: 0 };
+async function feedTick() {
+  if (!BOUNTY_FORWARDER || !BOUNTY_SPLITTER || !chain || !chain.forwarderPending) return;
+  try {
+    const { owed, held } = await chain.forwarderPending(BOUNTY_FORWARDER, BOUNTY_SPLITTER);
+    const total = owed + held; feedState.lastCheck = Date.now(); feedState.pendingWei = total;
+    if (total < FEED_MIN_WEI) { feedState.pendingSince = null; return; }
+    if (!feedState.pendingSince) feedState.pendingSince = Date.now();
+    if (Date.now() - feedState.pendingSince < 20 * 60000) return;   // give Proof's keeper 20 minutes first
+    const tx = await chain.crankForwarder(BOUNTY_FORWARDER, BOUNTY_SPLITTER);
+    feedState.lastCrank = { at: Date.now(), tx, wei: total }; feedState.cranks++; feedState.pendingSince = null; feedState.lastError = null;
+    console.log(`bounty feed: cranked ${total} wei into the Bounty · ${tx}`);
+  } catch (e) { feedState.lastError = String(e.message || e).slice(0, 160); console.log("bounty feed: " + feedState.lastError); }
+}
+if (BOUNTY_FORWARDER && BOUNTY_SPLITTER) { setTimeout(feedTick, 15000); setInterval(feedTick, 10 * 60000); }
 let jackpotPublic = null;   // the health sensor reads this; it also opens each week's rate as soon as the week is ready
 if (jackpot) { const tickJ = () => jackpot.publicState(Math.floor(Date.now() / 1000)).then((j) => { jackpotPublic = j; }).catch(() => {}); setTimeout(tickJ, 3000); setInterval(tickJ, 60000); }
 const GAME_TITLES = { voidrocks: "VOID ROCKS", coil: "COIL", breakpoint: "BREAKPOINT", moth: "MOTH", lander: "LANDER", chomp: "CHOMP", girder: "GIRDER", stack: "STACK", apex: "APEX" };
@@ -1003,6 +1023,12 @@ const server = http.createServer((req, res) => {
         sensors.sweepErrors = { status: settle.lastSweepErrors > 0 ? "yellow" : "green", detail: settle.lastSweepErrors > 0 ? (settle.lastError || settle.lastOpenError || "") : "clean" };
         sensors.stalePots = { status: settle.pending > 3 ? "red" : settle.pending > 0 ? "yellow" : "green", detail: `${settle.pending} unsettled past grace` };
       }
+        if (BOUNTY_FORWARDER && BOUNTY_SPLITTER) {   // $QTRS fees must actually reach the Bounty
+          const age = feedState.pendingSince ? Date.now() - feedState.pendingSince : 0;
+          sensors.bountyFeed = { status: feedState.lastError && age > 3600000 ? "red" : age > 3600000 ? "red" : age > 0 ? "yellow" : "green",
+            detail: feedState.pendingSince ? `${chain.fmt(feedState.pendingWei)} ETH of fees waiting ${Math.round(age / 60000)} min${feedState.lastError ? " · " + feedState.lastError : ""}`
+              : `fees flowing · ${feedState.cranks} backstop crank(s)${feedState.lastCheck ? "" : " · not checked yet"}` };
+        }
         if (JACKPOT_DOOR) {   // a door win that hasn't reached its winner is money owed right now
           const stuck = doorSettles.filter((j) => Date.now() - (j.since || Date.now()) > 10 * 60000);
           sensors.doorSettles = { status: stuck.length ? "red" : doorSettles.length ? "yellow" : "green",
