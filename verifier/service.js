@@ -79,12 +79,12 @@ const nameOf = (w) => (names[w] && names[w].name) || null;
 const GAME_NAMES = { 1: "VOID ROCKS", 2: "VR BOUNTY", 3: "BREAKPOINT", 4: "SWARM", 5: "MOTH", 6: "LANDER", 7: "HOPPER", 8: "AIRTIME", 9: "CHOMP", 10: "GIRDER", 11: "STACK", 12: "VORTEX", 13: "MINER", 14: "GRIDLOCK", 15: "APEX", 16: "MYRIAPOD", 17: "OVERRUN", 18: "SKYFALL", 19: "CLAIM", 20: "CANNONADE", 21: "EXODUS", 22: "CONDUIT", 23: "LOB", 24: "SUMMIT", 25: "COIL", 26: "VOID ROCKS BR", 27: "BREAKPOINT BR", 28: "SWARM BR", 29: "AIRTIME BR", 30: "APEX BR", 31: "MYRIAPOD BR" };
 // Settle records (one file per period) feed the daily X post and the public results.
 const SETTLES = path.join(RECEIPTS_DIR, "settles"); fs.mkdirSync(SETTLES, { recursive: true });
-function recordSettle(day, period, cab, pool, houseAdd, entries) {
+function recordSettle(day, period, cab, pool, houseAdd, entries, txSig) {
   const f = path.join(SETTLES, day + ".json"); let rec = { day, periodSeconds: period, cabs: {} };
   try { rec = JSON.parse(fs.readFileSync(f, "utf8")); } catch (e) {}
   const bps = (i) => (i < 3 ? [3000, 1800, 1200][i] : 4000 / 7);
   const present = entries.reduce((a, e, i) => a + (e.flagged ? 0 : bps(i)), 0);
-  rec.cabs[cab] = { pool, houseAdd, entries: entries.map((e, i) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged, payout: e.flagged || present === 0 ? 0 : Math.floor(pool * bps(i) / present) })) };
+  rec.cabs[cab] = { pool, houseAdd, txSig: txSig || null, contract: chain && chain.contract ? chain.contract : null, entries: entries.map((e, i) => ({ player: e.player, name: nameOf(e.player), score: e.score, flagged: e.flagged, payout: e.flagged || present === 0 ? 0 : Math.floor(pool * bps(i) / present) })) };
   fs.writeFileSync(f + ".tmp", JSON.stringify(rec)); fs.renameSync(f + ".tmp", f);
 }
 const poster = require("./poster.js")({ dir: RECEIPTS_DIR, network: process.env.QR_NETWORK || "devnet", log: console.log });
@@ -253,7 +253,7 @@ async function settleSweep() {
           settle.settled++; pending--;
           stats.potsSettled++; if (anyPaid && pool > 0) { stats.paidOutLamports += pool; stats.potsPaid++; }
           stats.updatedAt = Date.now(); saveJson("stats.json", stats);
-          try { recordSettle(day, period, cab, Math.max(0, pool), (houseAdds[chain.potId(cab, day)] || {}).lamports || 0, pot.entries); } catch (e) { console.log("settle: record failed " + e.message); }
+          try { recordSettle(day, period, cab, Math.max(0, pool), (houseAdds[chain.potId(cab, day)] || {}).lamports || 0, pot.entries, txSig); } catch (e) { console.log("settle: record failed " + e.message); }
           if (chain.kind === "evm") { try { await buybackLane(cab, day, pot); } catch (e) { console.log(`buyback: cab ${cab} day ${day} failed: ${String(e.message || e).slice(0, 160)}`); } }
           console.log(`settle: cabinet ${cab} day ${day} settled ${pot.entries.length} entr${pot.entries.length === 1 ? "y" : "ies"} ${String(txSig).slice(0, 12)}…`);
         } catch (e) {
@@ -841,6 +841,26 @@ const server = http.createServer((req, res) => {
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
   }
+  // PAST WINNERS: one machine's settled days, newest first (days nobody played are left out)
+  { const m = req.url.match(/^\/winners\/(\d{1,3})(\?days=(\d{1,3}))?$/);
+    if (req.method === "GET" && m) {
+      const cab = parseInt(m[1], 10), want = Math.min(60, parseInt(m[3] || "14", 10) || 14);
+      const days = [];
+      try {
+        const files = fs.readdirSync(SETTLES).filter((n) => /^\d+\.json$/.test(n)).map((n) => parseInt(n, 10)).sort((a, b) => b - a);
+        for (const d of files) {
+          if (days.length >= want) break;
+          let rec; try { rec = JSON.parse(fs.readFileSync(path.join(SETTLES, d + ".json"), "utf8")); } catch (e) { continue; }
+          const c = rec.cabs && rec.cabs[cab]; if (!c || !c.entries || !c.entries.length) continue;
+          const paid = c.entries.filter((e) => e.payout > 0);
+          days.push({ day: rec.day, date: new Date(rec.day * rec.periodSeconds * 1000).toISOString().slice(0, 10), pool: c.pool, houseAdd: c.houseAdd || 0,
+            players: c.entries.length, txSig: c.txSig || null,
+            winners: c.entries.slice(0, 3).map((e, i) => ({ rank: i + 1, player: e.player, name: e.name || nameOf(e.player), score: e.score, payout: e.payout || 0, flagged: !!e.flagged })),
+            paidTotal: paid.reduce((a, e) => a + e.payout, 0) });
+        }
+      } catch (e) {}
+      return send(200, { cabinetId: cab, unit: chain ? chain.unit : null, days });
+    } }
   if (req.method === "GET" && req.url === "/leaderboards") {
     if (!chain) return send(503, { error: "chain mode off" });
     if (readCache.lb && Date.now() - readCache.lb.at < 8000) return send(200, readCache.lb.body);
