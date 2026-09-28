@@ -1,4 +1,4 @@
-// THE BOUNTY rotates. Cabinet 2 is the one machine $QTR trading fees feed
+// THE BOUNTY rotates. Cabinet 2 is the one machine $QTRS trading fees feed
 // (BountyFeeder → seedBounty(2), fixed forever), so the pivot is WHICH GAME
 // cabinet 2 runs: a published weekly schedule, jackpot-schedule.json.
 //

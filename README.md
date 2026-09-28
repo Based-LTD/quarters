@@ -52,11 +52,13 @@ score = f(committed_seed, your_inputs)
 4. **Re-execute.** The verifier checks the secret against the on-chain commitment, replays the inputs from scratch with the same engine, and only if the score and state hash reproduce exactly does it call `submitScores`. It publishes the receipt, and the on-chain `ScoreSubmitted` event carries the replay hash.
 5. **Anyone can re-run it.** See below.
 
+Bots are a risk in any skill contest. The mechanism is public; the threshold values production runs on are private settings (`TAS_*`), so the defaults in this file aren't the numbers a bot has to beat. Runs submitted faster than they could have been played in real time are flagged too.
+
 Bots are a risk in any skill contest. The verifier flags runs whose input timing is machine-regular (`analyzeInputs` in `verifier/service.js`). Flagged runs still go on the board with the flag on their receipt, but a flagged entry is skipped at settlement and cannot take THE BOUNTY.
 
-## The jackpot door (from $QTR launch)
+## The jackpot door (from $QTRS launch)
 
-[`contracts/src/JackpotDoor.sol`](contracts/src/JackpotDoor.sol): jackpot coins go in through the door, which is the player of record on Quarters and pays the real winner by $QTR status, fixed when the coin goes in: holders take the jackpot up to 1 ETH, non-holders 25% of it; the rest is a reserve that refills the next jackpot to 1 ETH. No owner withdraw; money leaves only to a verified winner or back into the Bounty pool. Rule changes are posted in [`RULES.md`](RULES.md) before they take effect.
+[`contracts/src/JackpotDoor.sol`](contracts/src/JackpotDoor.sol): jackpot coins go in through the door, which is the player of record on Quarters and pays the real winner by $QTRS status, fixed when the coin goes in: holders take the jackpot up to 1 ETH, non-holders 25% of it; the rest is a reserve that refills the next jackpot to 1 ETH. No owner withdraw; money leaves only to a verified winner or back into the Bounty pool. Rule changes are posted in [`RULES.md`](RULES.md) before they take effect.
 
 ## Re-run a receipt yourself
 

@@ -130,7 +130,7 @@ const jackpot = chain && chain.kind === "evm" && fs.existsSync(JACKPOT_SCHEDULE)
   ? require("./jackpot.js")({ chain, cab: 2, scheduleFile: JACKPOT_SCHEDULE, stateFile: path.join(RECEIPTS_DIR, "_jackpot.json") }) : null;
 // THE BOUNTY's door (evm/src/JackpotDoor.sol). Coins inserted at/after
 // JACKPOT_DOOR_FROM must come through the door; it is the player of record on
-// Quarters and pays the real winner by $QTR status. Pivot = a new door.
+// Quarters and pays the real winner by $QTRS status. Pivot = a new door.
 const JACKPOT_DOOR = process.env.JACKPOT_DOOR && /^0x[0-9a-fA-F]{40}$/.test(process.env.JACKPOT_DOOR) ? process.env.JACKPOT_DOOR : null;
 const JACKPOT_DOOR_FROM = process.env.JACKPOT_DOOR_FROM ? Math.floor(Date.parse(process.env.JACKPOT_DOOR_FROM) / 1000) : Infinity;
 let doorParamsCache = null;
@@ -361,7 +361,8 @@ async function chainSubmit(creditId, body, result) {
   // Per-wallet volume this period feeds the behavior analysis.
   { const w = realPlayer; const v = walletVolume.get(w); const dayNow = credit.day;
     const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
-    result.tas = analyzeInputs(result.masks || [], { volume: count }); }
+    let elapsedS = null; try { elapsedS = (await chain.now()) - credit.insertedAt; } catch (e) {}
+    result.tas = analyzeInputs(result.masks || [], { volume: count, elapsedS }); }
   const replayHash = crypto.createHash("sha256").update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE })).digest();
   const sub = { creditId, credit, player: credit.player, secret: body.secret, score: jst ? jackpot.toPoints(result.score, jst) : result.score, replayHash, flagged: !!result.tas.flagged };
   if (jst) jackpot.noteRaw(replayHash.toString("hex"), result.score);
@@ -548,6 +549,14 @@ function announceBounty(player, score, prevRecord, pool, game) {
 // Each signal is a soft score; a run is FLAGGED when enough of them agree.
 // A flag never blocks a score — it holds the payout for review (clear_flag).
 const walletVolume = new Map();   // wallet → { day, count }
+// Bot-detection thresholds. The mechanism is public; the numbers production
+// uses are not: TAS_* settings (Fly secrets) override these defaults, so the
+// published values aren't the ones a bot would have to beat.
+const TAS = {
+  modal: parseFloat(process.env.TAS_MODAL || "0.9"), cv: parseFloat(process.env.TAS_CV || "0.12"), fast: parseFloat(process.env.TAS_FAST || "0.35"),
+  quant: parseFloat(process.env.TAS_QUANT || "0.9"), warmup: parseInt(process.env.TAS_WARMUP || "3", 10), volume: parseInt(process.env.TAS_VOLUME || "60", 10),
+  realtimeSlackS: parseInt(process.env.TAS_REALTIME_SLACK_S || "20", 10),
+};
 function analyzeInputs(masks, ctx = {}) {
   const gaps = [], holds = [];
   let prev = 0, lastEdge = -1, firstInput = -1, holdLen = 0, holdMask = 0;
@@ -569,20 +578,22 @@ function analyzeInputs(masks, ctx = {}) {
     const sd = Math.sqrt(gaps.reduce((a, g) => a + (g - mean) * (g - mean), 0) / n);
     f.gapCv = mean > 0 ? sd / mean : 0;
     f.fastShare = gaps.filter((g) => g <= 2).length / n;          // ≤ 33 ms between distinct presses
-    if (f.modalShare > 0.9) signals.push("metronome");            // one exact gap almost always
-    else if (f.gapCv < 0.12) signals.push("too-regular");         // humans: CV ≈ 0.3–0.8
-    if (f.fastShare > 0.35) signals.push("superhuman-speed");
+    if (f.modalShare > TAS.modal) signals.push("metronome");            // one exact gap almost always
+    else if (f.gapCv < TAS.cv) signals.push("too-regular");         // humans: CV ≈ 0.3–0.8
+    if (f.fastShare > TAS.fast) signals.push("superhuman-speed");
     if (holds.length >= 30) {
       const hc = new Map(); for (const h of holds) hc.set(h, (hc.get(h) || 0) + 1);
       f.holdQuant = Math.max(...hc.values()) / holds.length;
-      if (f.holdQuant > 0.9) signals.push("quantized-holds");
+      if (f.holdQuant > TAS.quant) signals.push("quantized-holds");
     }
-    if (firstInput >= 0 && firstInput < 3 && masks.length > 600) signals.push("no-warmup");
+    if (firstInput >= 0 && firstInput < TAS.warmup && masks.length > 600) signals.push("no-warmup");
   }
-  if ((ctx.volume || 0) > 60) signals.push("volume");           // > 60 paid runs this period from one wallet
+  if ((ctx.volume || 0) > TAS.volume) signals.push("volume");
+  // a human plays in real time: a run can't arrive before its own length after the coin went in
+  if (ctx.elapsedS != null && masks.length > 600 && ctx.elapsedS + TAS.realtimeSlackS < masks.length / 60) signals.push("faster-than-real-time");           // > 60 paid runs this period from one wallet
   // Score: strong signals count double. Flag at 2+ points, so one soft trait
   // alone (a fast player, a warm-up skip) never flags a person.
-  const weight = { metronome: 2, "too-regular": 1, "superhuman-speed": 1, "quantized-holds": 1, "no-warmup": 1, volume: 2 };
+  const weight = { metronome: 2, "too-regular": 1, "superhuman-speed": 1, "quantized-holds": 1, "no-warmup": 1, volume: 2, "faster-than-real-time": 2 };
   const score = signals.reduce((a, s) => a + (weight[s] || 1), 0);
   return { flagged: score >= 2, score, signals, features: f, edgeGaps: n, modalShare: Math.round(f.modalShare * 100) / 100 };
 }
@@ -674,7 +685,8 @@ const server = http.createServer((req, res) => {
   }
   // Admin: send a draft now, or compose a test post. ADMIN_TOKEN must match.
   if (req.method === "POST" && /^\/posts\/(test|[a-f0-9]{12})\/send$/.test(req.url)) {
-    if (!process.env.ADMIN_TOKEN || req.headers["x-admin-token"] !== process.env.ADMIN_TOKEN) return send(401, { error: "admin token" });
+    const at = Buffer.from(String(req.headers["x-admin-token"] || "")), want = Buffer.from(String(process.env.ADMIN_TOKEN || ""));
+    if (!want.length || at.length !== want.length || !crypto.timingSafeEqual(at, want)) return send(401, { error: "admin token" });   // constant-time
     const id = req.url.split("/")[2];
     (async () => {
       if (id === "test") { const rec = await poster.queue("test", "test:" + Date.now(), "QUARTERS results bot online · " + new Date().toISOString().slice(0, 16) + "Z", null); return send(200, rec); }
@@ -709,6 +721,8 @@ const server = http.createServer((req, res) => {
       try {
         const b = JSON.parse(raw || "{}"); const name = String(b.name || "").trim();
         if (!/^[A-Za-z0-9_]{3,16}$/.test(name)) return send(422, { error: "name must be 3–16 letters, digits or _" });
+        // no names that could pass for staff or the project
+        if (/quarter|qtrs|official|admin|support|staff|verif|based|proof|mod$|^mod|team|dev$|^dev|jackpot|bounty/i.test(name)) return send(422, { error: "that name is reserved" });
         const msg = "QUARTERS name: " + name;
         if (b.message !== msg) return send(422, { error: "bad message" });
         let w = String(b.wallet || "");

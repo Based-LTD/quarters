@@ -4,6 +4,8 @@ name: uptime
 # coverage, settle-sweep freshness and errors, stale pots) into one status and
 # answers 503 on red. Fails (and GitHub emails the repo owners) on red, on an
 # unreachable verifier, or if the site is down. Yellow is logged, not failed.
+permissions:
+  contents: read   # read-only: this job only curls two URLs
 on:
   schedule:
     - cron: "*/15 * * * *"
