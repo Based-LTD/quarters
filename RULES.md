@@ -5,6 +5,9 @@ Every rule change, posted here before it takes effect. Newest first. Nothing on 
 ## Upcoming, at $QTRS launch (date posted here first): the jackpot door, $QTRS status
 Jackpot coins go in through `JackpotDoor.sol`. Holding the minimum $QTRS when your coin goes in: you take the whole jackpot, up to 1 ETH. Not holding: 25% of it. The rest stays in a reserve that tops the next jackpot back up to 1 ETH. No owner withdraw: the door only pays a verified winner or sends money back into the jackpot. Same games, targets, and scores for everyone. Minimum holding and start date: posted here before they take effect.
 
+## 2026-09-28: Claude reviews every Bounty win first
+Each winning Bounty run is measured from its replay (threat reaction times, score curve, input patterns, bot checks, wallet history) and reviewed by Claude (`verifier/reviewer.js`) before it pays. Confident "human" with no bot flags pays right away; "unsure" or "bot" goes to a person with the reasoning; on timeout Claude's recommendation stands. The verdict and reasons are in the run's public record.
+
 ## 2026-09-28: every Bounty win is reviewed
 Every winning Bounty run, whatever the pool, gets a human replay review before it pays (was: pools over 0.1 ETH). Inside the contract's 20-minute window; if nobody reviews it in time, it pays. Runs submitted faster than real time are flagged.
 

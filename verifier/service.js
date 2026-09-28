@@ -745,6 +745,18 @@ const server = http.createServer((req, res) => {
     return;
   }
   // Buyback receipts (public): every sponsored-cabinet buyback with its transactions.
+  // admin: review hand-built evidence (e.g. a disguised bot) to check the reviewer discriminates
+  if (req.method === "POST" && req.url === "/review-selftest") {
+    const at = Buffer.from(String(req.headers["x-admin-token"] || "")), want = Buffer.from(String(process.env.ADMIN_TOKEN || ""));
+    if (!want.length || at.length !== want.length || !crypto.timingSafeEqual(at, want)) return send(401, { error: "admin token" });
+    let raw = ""; req.on("data", (c) => { raw += c; if (raw.length > 200000) req.destroy(); });
+    req.on("end", async () => {
+      try { const { evidence } = JSON.parse(raw || "{}"); if (!evidence) return send(422, { error: "evidence required" });
+        const t0 = Date.now(), verdict = await reviewer.review(evidence); send(200, { ms: Date.now() - t0, verdict }); }
+      catch (e) { send(500, { error: String(e.message || e).slice(0, 200) }); }
+    });
+    return;
+  }
   if (req.method === "POST" && /^\/review-selftest\/[A-Za-z0-9_-]{1,66}$/.test(req.url)) {
     const at = Buffer.from(String(req.headers["x-admin-token"] || "")), want = Buffer.from(String(process.env.ADMIN_TOKEN || ""));
     if (!want.length || at.length !== want.length || !crypto.timingSafeEqual(at, want)) return send(401, { error: "admin token" });
