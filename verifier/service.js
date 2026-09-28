@@ -134,6 +134,23 @@ const GAME_TITLES = { voidrocks: "VOID ROCKS", coil: "COIL", breakpoint: "BREAKP
 const gameTitle = (g) => GAME_TITLES[g] || String(g || "").toUpperCase();
 // Cabinet 2's on-chain scores are jackpot points; boards show the raw game score.
 const shownScore = (cab, e) => { if (!jackpot || cab !== 2) return e.score; const r = jackpot.rawFor(e.replayHash); return r != null ? r : e.score; };
+// THE BOUNTY's board is the week's, not the day's: it doesn't reset at midnight.
+// Built from the chain: every day's pot for cabinet 2 since the week opened (a
+// week's top ten is always inside some day's top ten, so nothing is missed).
+async function weekEntries(cab) {
+  if (!jackpot) return null;
+  const nowS = await chain.now(), w = jackpot.weekAt(nowS); if (!w) return null;
+  const hit = readCache["week" + cab]; if (hit && Date.now() - hit.at < 8000 && hit.from === w.from) return hit.v;
+  const period = (await chain.config()).periodSeconds;
+  const d0 = Math.floor(w.fromS / period), d1 = Math.floor(nowS / period), seen = new Set(), all = [];
+  const days = []; for (let d = Math.max(d0, d1 - 13); d <= d1; d++) days.push(d);
+  const pots = await Promise.all(days.map((d) => chain.pot(cab, d).catch(() => null)));
+  pots.forEach((pot) => { if (pot) for (const e of pot.entries) { if (seen.has(e.replayHash)) continue; seen.add(e.replayHash);
+    all.push({ player: e.player, name: nameOf(e.player), score: shownScore(cab, e), replayHash: e.replayHash, flagged: e.flagged }); } });
+  all.sort((a, b) => b.score - a.score);
+  readCache["week" + cab] = { at: Date.now(), from: w.from, v: all };
+  return all;
+}
 async function bountyView(b) {
   const v = { record: b.record, floor: b.floor || 0, bar: b.bar != null ? b.bar : b.record, champion: b.champion, lamports: b.pool, championName: nameOf(b.champion) };
   if (jackpot) {
@@ -195,7 +212,9 @@ async function settleSweep() {
     // House adds: seed each live pot once (this and next period) so no board is empty-handed.
     if (HOUSE_ADD > 0) {
       for (const day of [nowDay, nowDay + 1]) for (let cab = 1; cab <= MAX_CAB; cab++) {
-        if (!isLive(cab) || !(await cabinetInfo(cab))) continue;   // only cabinets that exist on this arcade
+        const ci = isLive(cab) ? await cabinetInfo(cab) : null;
+        if (!ci) continue;   // only cabinets that exist on this arcade
+        if (ci.isBounty) continue;   // THE BOUNTY pays by beating the score, not a daily pot: no daily seed
         const key = chain.potId(cab, day);
         if (houseAdds[key]) continue;
         try {
@@ -681,6 +700,7 @@ const server = http.createServer((req, res) => {
           houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 10) };
         if (info.isBounty) {
           try { board.bounty = await bountyView(await chain.bounty(cab)); if (board.bounty.game) board.game = board.bounty.game; } catch (e) {}
+          try { const wk = await weekEntries(cab); if (wk) { board.top = wk.slice(0, 10); board.count = wk.length; board.scope = "week"; } } catch (e) {}
         }
         boards.push(board);
       }));
@@ -710,7 +730,10 @@ const server = http.createServer((req, res) => {
       let bounty = null;
       try {
         const cab = await cabinetInfo(cabId);
-        if (cab && cab.isBounty) bounty = await bountyView(await chain.bounty(cabId));
+        if (cab && cab.isBounty) {
+          bounty = await bountyView(await chain.bounty(cabId));
+          const wk = await weekEntries(cabId); if (wk) { entries = wk.slice(0, 10); bounty.scope = "week"; }
+        }
       } catch (e) { /* no bounty */ }
       if (bounty && bounty.champion) bounty.championName = nameOf(bounty.champion);
       let sponsor = null; if (chain.kind === "evm") { try { const sp = await chain.sponsor(cabId); if (sp) sponsor = { token: sp.token, buybackBps: sp.buybackBps, accruedWei: await chain.buybackAccrued(cabId), lastBuyback: buybacks.filter((b) => b.cab === cabId).slice(-1)[0] || null }; } catch (e) {} }

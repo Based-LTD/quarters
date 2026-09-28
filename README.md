@@ -68,6 +68,7 @@ Public verifier endpoints:
 ```
 GET /leaderboards               every live cabinet's pot and top ten, the bounty, and the next payout time
 GET /leaderboard/:cabinetId     one cabinet, straight from the chain (incl. bounty record, floor, pool)
+GET /jackpot                    this week's Bounty game, raw score to beat, pool, and the schedule
 GET /player/:wallet             a wallet's standings and receipts
 GET /replays/:creditId.json     a receipt
 GET /stats                      totals
