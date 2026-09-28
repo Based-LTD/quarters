@@ -54,6 +54,10 @@ score = f(committed_seed, your_inputs)
 
 Bots are a risk in any skill contest. The verifier flags runs whose input timing is machine-regular (`analyzeInputs` in `verifier/service.js`). Flagged runs still go on the board with the flag on their receipt, but a flagged entry is skipped at settlement and cannot take THE BOUNTY.
 
+## The jackpot door (from $QTR launch)
+
+[`contracts/src/JackpotDoor.sol`](contracts/src/JackpotDoor.sol): jackpot coins go in through the door, which is the player of record on Quarters and pays the real winner by $QTR status, fixed when the coin goes in: holders take the jackpot up to 1 ETH, non-holders 25% of it; the rest is a reserve that refills the next jackpot to 1 ETH. No owner withdraw; money leaves only to a verified winner or back into the Bounty pool. Rule changes are posted in [`RULES.md`](RULES.md) before they take effect.
+
 ## Re-run a receipt yourself
 
 ```bash
@@ -88,7 +92,7 @@ A pack (`openTab(sessionKey, sessionFloat)`) escrows your deposit in the contrac
 ## What's in here
 
 ```
-contracts/           Quarters.sol + BountyFeeder.sol, Foundry tests, forge-std, the ABI
+contracts/           Quarters.sol, BountyFeeder.sol, JackpotDoor.sol, Foundry tests, forge-std, ABIs
 verifier/            the verifier service, its EVM chain adapter, and its tests
 engine/              24 deterministic game engines (plain JS, shared verbatim by client and verifier)
 tools/replay.js      re-run any receipt

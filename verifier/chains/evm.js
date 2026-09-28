@@ -4,13 +4,19 @@
 // a submit waits up to SUBMIT_BATCH_MS for company, then one transaction
 // carries every pending run for that cabinet — gas is real money here.
 const fs = require("fs"), path = require("path"), crypto = require("crypto");
-const { createPublicClient, createWalletClient, http, parseAbi, parseAbiParameters, encodeAbiParameters, keccak256, encodePacked, getAddress, formatEther } = require("viem");
+const { createPublicClient, createWalletClient, http, parseAbi, parseAbiParameters, encodeAbiParameters, keccak256, encodePacked, getAddress, formatEther, decodeEventLog } = require("viem");
 const { privateKeyToAccount } = require("viem/accounts");
 const { nonceManager } = require("viem/nonce");
 
 function loadAbi() {
   const p = path.join(__dirname, "../../contracts/out/Quarters.sol/Quarters.json");
   return JSON.parse(fs.readFileSync(p, "utf8")).abi;
+}
+
+let _doorAbi = null;
+function doorAbi() {
+  if (!_doorAbi) _doorAbi = JSON.parse(fs.readFileSync(path.join(__dirname, "../../contracts/out/JackpotDoor.sol/JackpotDoor.json"), "utf8")).abi;
+  return _doorAbi;
 }
 
 function makeEvmChain({ rpcUrl, chainId, contract, privateKey, network, log = console.log }) {
@@ -71,6 +77,32 @@ function makeEvmChain({ rpcUrl, chainId, contract, privateKey, network, log = co
     },
     // floor: the contract's minimum winning score (contracts before bountyFloor have none).
     // bar = what a run must BEAT to pay — the same max() the contract applies in _submit.
+    // --- THE BOUNTY's door (evm/src/JackpotDoor.sol) ---
+    async doorSeat(door, commitHex) {
+      const r = await pub.readContract({ address: getAddress(door), abi: doorAbi(), functionName: "seats", args: ["0x" + commitHex.replace(/^0x/, "")] });
+      return { player: r[0], holder: r[1], settled: r[2] };
+    },
+    async doorParams(door) {
+      const d = getAddress(door), rd = (fn) => pub.readContract({ address: d, abi: doorAbi(), functionName: fn });
+      const [cap, nonHolderBps, refillTo, token, holdMin, reserve, retired] = await Promise.all(["cap", "nonHolderBps", "refillTo", "token", "holdMin", "reserve", "retired"].map(rd));
+      return { cap: Number(cap), nonHolderBps: Number(nonHolderBps), refillTo: Number(refillTo), token, holdMin: holdMin.toString(), reserve: Number(reserve), retired };
+    },
+    async doorIsHolder(door, who) { return pub.readContract({ address: getAddress(door), abi: doorAbi(), functionName: "isHolder", args: [getAddress(who)] }); },
+    // what a winning submit actually paid, straight from its receipt (BountyClaimed)
+    async bountyPaidIn(txHash) {
+      const rc = await pub.getTransactionReceipt({ hash: txHash });
+      for (const lg of rc.logs) {
+        if (getAddress(lg.address) !== address) continue;
+        try { const ev = decodeEventLog({ abi, data: lg.data, topics: lg.topics }); if (ev.eventName === "BountyClaimed") return { player: ev.args.player, score: Number(ev.args.score), paidWei: ev.args.paidWei }; } catch (e) {}
+      }
+      return null;
+    },
+    async doorSettle(door, commitHex, receivedWei) {
+      const hash = await serial(() => wallet.writeContract({ address: getAddress(door), abi: doorAbi(), functionName: "settle", args: ["0x" + commitHex.replace(/^0x/, ""), BigInt(receivedWei)] }));
+      const rc = await pub.waitForTransactionReceipt({ hash, timeout: 60000 });
+      if (rc.status !== "success") throw new Error(`door settle reverted ${hash}`);
+      return hash;
+    },
     async bounty(cab) {
       const b = await read("bounties", [cab]);
       let floor = 0;

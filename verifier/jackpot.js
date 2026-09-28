@@ -17,7 +17,7 @@ const fs = require("fs");
 
 module.exports = function makeJackpot({ chain, cab = 2, scheduleFile, stateFile, log = console.log }) {
   let state = {}; try { state = JSON.parse(fs.readFileSync(stateFile, "utf8")); } catch (e) {}
-  state.weeks = state.weeks || {}; state.rawByReplay = state.rawByReplay || {};
+  state.weeks = state.weeks || {}; state.rawByReplay = state.rawByReplay || {}; state.playerByReplay = state.playerByReplay || {};
   const save = () => { try { fs.writeFileSync(stateFile, JSON.stringify(state, null, 1)); } catch (e) { log("jackpot: save failed " + e.message); } };
 
   function schedule() {
@@ -51,6 +51,9 @@ module.exports = function makeJackpot({ chain, cab = 2, scheduleFile, stateFile,
     weekAt, rate, toPoints, barRaw, schedule,
     noteRaw(replayHashHex, raw) { state.rawByReplay[replayHashHex] = raw; const ks = Object.keys(state.rawByReplay); if (ks.length > 5000) delete state.rawByReplay[ks[0]]; save(); },
     rawFor(replayHashHex) { return state.rawByReplay[replayHashHex]; },
+    // door plays sit on-chain under the door's address; this is who actually played
+    notePlayer(replayHashHex, player) { state.playerByReplay[replayHashHex] = player; const ks = Object.keys(state.playerByReplay); if (ks.length > 5000) delete state.playerByReplay[ks[0]]; save(); },
+    playerFor(replayHashHex) { return state.playerByReplay[replayHashHex]; },
     noteWin(week, raw) { const st = state.weeks[week.from]; if (st && (st.recordRaw == null || raw > st.recordRaw)) { st.recordRaw = raw; save(); } },
     // What the site shows: this week's game, the raw score to beat, when it rotates.
     async publicState(nowS) {

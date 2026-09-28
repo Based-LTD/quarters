@@ -128,6 +128,46 @@ if (process.env.CHAIN === "evm") {
 const JACKPOT_SCHEDULE = process.env.JACKPOT_SCHEDULE || path.join(__dirname, "jackpot-schedule.json");
 const jackpot = chain && chain.kind === "evm" && fs.existsSync(JACKPOT_SCHEDULE)
   ? require("./jackpot.js")({ chain, cab: 2, scheduleFile: JACKPOT_SCHEDULE, stateFile: path.join(RECEIPTS_DIR, "_jackpot.json") }) : null;
+// THE BOUNTY's door (evm/src/JackpotDoor.sol). Coins inserted at/after
+// JACKPOT_DOOR_FROM must come through the door; it is the player of record on
+// Quarters and pays the real winner by $QTR status. Pivot = a new door.
+const JACKPOT_DOOR = process.env.JACKPOT_DOOR && /^0x[0-9a-fA-F]{40}$/.test(process.env.JACKPOT_DOOR) ? process.env.JACKPOT_DOOR : null;
+const JACKPOT_DOOR_FROM = process.env.JACKPOT_DOOR_FROM ? Math.floor(Date.parse(process.env.JACKPOT_DOOR_FROM) / 1000) : Infinity;
+let doorParamsCache = null;
+async function doorParams() {
+  if (!JACKPOT_DOOR) return null;
+  if (doorParamsCache && Date.now() - doorParamsCache.at < 60000) return doorParamsCache.v;
+  const v = await chain.doorParams(JACKPOT_DOOR); doorParamsCache = { at: Date.now(), v }; return v;
+}
+// what a door seat actually takes home from a pool of `pool` wei
+function doorPayout(p, holder, pool) { const j = Math.min(pool, p.cap); return holder ? j : Math.floor(j * p.nonHolderBps / 10000); }
+// door wins settle right after the submit; failures retry every minute until the seat says settled
+const DOOR_SETTLES = path.join(RECEIPTS_DIR, "_door_settles.json");
+let doorSettles = []; try { doorSettles = JSON.parse(fs.readFileSync(DOOR_SETTLES, "utf8")); } catch (e) {}
+const saveDoorSettles = () => { try { fs.writeFileSync(DOOR_SETTLES, JSON.stringify(doorSettles, null, 1)); } catch (e) {} };
+async function trySettle(job) {
+  const seat = await chain.doorSeat(job.door, job.commit);
+  if (seat.settled) return { done: true };
+  const paid = await chain.bountyPaidIn(job.txSig);
+  if (!paid) return { done: false, error: "no BountyClaimed in " + job.txSig };
+  const tx = await chain.doorSettle(job.door, job.commit, paid.paidWei);
+  return { done: true, tx, receivedWei: paid.paidWei.toString() };
+}
+async function settleDoorWin(job) {
+  try { const r = await trySettle(job); if (r.done) { console.log(`door: settled ${job.commit.slice(0, 12)} ${r.tx || "(already)"}`); return r; } job.lastError = r.error; }
+  catch (e) { job.lastError = String(e.message || e).slice(0, 200); }
+  job.tries = (job.tries || 0) + 1; job.since = job.since || Date.now();
+  doorSettles = doorSettles.filter((j) => j.commit !== job.commit).concat([job]); saveDoorSettles();
+  console.log(`door: settle ${job.commit.slice(0, 12)} failed, will retry: ${job.lastError}`);
+  return null;
+}
+if (JACKPOT_DOOR && chain) setInterval(async () => {
+  for (const job of doorSettles.slice()) {
+    try { const r = await trySettle(job); if (r.done) { doorSettles = doorSettles.filter((j) => j !== job); saveDoorSettles(); console.log(`door: settled on retry ${job.commit.slice(0, 12)}`); } else { job.lastError = r.error; job.tries++; } }
+    catch (e) { job.lastError = String(e.message || e).slice(0, 200); job.tries++; }
+  }
+}, 60000);
+const shownPlayer = (cab, e) => (jackpot && cab === 2 ? jackpot.playerFor(e.replayHash) || e.player : e.player);
 let jackpotPublic = null;   // the health sensor reads this; it also opens each week's rate as soon as the week is ready
 if (jackpot) { const tickJ = () => jackpot.publicState(Math.floor(Date.now() / 1000)).then((j) => { jackpotPublic = j; }).catch(() => {}); setTimeout(tickJ, 3000); setInterval(tickJ, 60000); }
 const GAME_TITLES = { voidrocks: "VOID ROCKS", coil: "COIL", breakpoint: "BREAKPOINT", moth: "MOTH", lander: "LANDER", chomp: "CHOMP", girder: "GIRDER", stack: "STACK", apex: "APEX" };
@@ -146,7 +186,7 @@ async function weekEntries(cab) {
   const days = []; for (let d = Math.max(d0, d1 - 13); d <= d1; d++) days.push(d);
   const pots = await Promise.all(days.map((d) => chain.pot(cab, d).catch(() => null)));
   pots.forEach((pot) => { if (pot) for (const e of pot.entries) { if (seen.has(e.replayHash)) continue; seen.add(e.replayHash);
-    all.push({ player: e.player, name: nameOf(e.player), score: shownScore(cab, e), replayHash: e.replayHash, flagged: e.flagged }); } });
+    const pl = shownPlayer(cab, e); all.push({ player: pl, name: nameOf(pl), score: shownScore(cab, e), replayHash: e.replayHash, flagged: e.flagged }); } });
   all.sort((a, b) => b.score - a.score);
   readCache["week" + cab] = { at: Date.now(), from: w.from, v: all };
   return all;
@@ -156,6 +196,10 @@ async function bountyView(b) {
   if (jackpot) {
     try { const j = await jackpot.publicState(Math.floor(Date.now() / 1000));
       if (j) Object.assign(v, { game: j.game, target: j.target, barRaw: j.barRaw, weekRecordRaw: j.weekRecordRaw, rotatesAt: j.rotatesAt, next: j.next, paused: j.paused }); } catch (e) {}
+  }
+  if (JACKPOT_DOOR) {
+    try { const p = await doorParams(); v.door = { address: JACKPOT_DOOR, cap: p.cap, nonHolderBps: p.nonHolderBps, refillTo: p.refillTo, reserve: p.reserve, holdMin: p.holdMin,
+      token: /^0x0+$/.test(p.token) ? null : p.token, from: Number.isFinite(JACKPOT_DOOR_FROM) ? JACKPOT_DOOR_FROM : null, retired: p.retired }; } catch (e) {}
   }
   return v;
 }
@@ -298,17 +342,32 @@ async function chainSubmit(creditId, body, result) {
     // 503 on purpose: the client keeps the run and retries until the owner opens the week
     if (!jst) return { ok: false, code: 503, reason: "THE BOUNTY is rotating to " + gameTitle(jw.game) + ". Your run is saved and lands as soon as the new week opens." };
   }
-  // Per-wallet volume this period feeds the behavior analysis.
-  { const w = credit.player; const v = walletVolume.get(w); const dayNow = credit.day;
-    const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
-    result.tas = analyzeInputs(result.masks || [], { volume: count }); }
   // The chain's commitment is the truth: sha256(secret) must equal it.
   const commit = crypto.createHash("sha256").update(Buffer.from(body.secret, "hex")).digest();
   if (credit.commit && !commit.equals(credit.commit)) return { ok: false, code: 422, reason: "secret does not match on-chain commitment" };
   if (credit.salt !== String(body.salt).toLowerCase()) return { ok: false, code: 422, reason: "salt does not match the credit" };
+  // THE BOUNTY's door: the door is the player of record; its seat says who really played and their status.
+  let seat = null, doorP = null;
+  if (cab.isBounty && JACKPOT_DOOR) {
+    const viaDoor = sameAddr(credit.player, JACKPOT_DOOR);
+    if (!viaDoor && credit.insertedAt >= JACKPOT_DOOR_FROM) return { ok: false, code: 422, reason: "Bounty coins go through the jackpot door; this one didn't" };
+    if (viaDoor) {
+      seat = await chain.doorSeat(JACKPOT_DOOR, commit.toString("hex"));
+      if (!seat.player || /^0x0+$/.test(seat.player)) return { ok: false, code: 422, reason: "no jackpot door seat for this coin" };
+      doorP = await doorParams();
+    }
+  }
+  const realPlayer = seat ? seat.player : credit.player;
+  // Per-wallet volume this period feeds the behavior analysis.
+  { const w = realPlayer; const v = walletVolume.get(w); const dayNow = credit.day;
+    const count = v && v.day === dayNow ? v.count + 1 : 1; walletVolume.set(w, { day: dayNow, count });
+    result.tas = analyzeInputs(result.masks || [], { volume: count }); }
   const replayHash = crypto.createHash("sha256").update(JSON.stringify({ game: body.game, seed: body.seed, inputsRLE: body.inputsRLE })).digest();
   const sub = { creditId, credit, player: credit.player, secret: body.secret, score: jst ? jackpot.toPoints(result.score, jst) : result.score, replayHash, flagged: !!result.tas.flagged };
   if (jst) jackpot.noteRaw(replayHash.toString("hex"), result.score);
+  if (seat && jackpot) jackpot.notePlayer(replayHash.toString("hex"), realPlayer);
+  const takeHome = (pool) => (seat ? doorPayout(doorP, seat.holder, pool) : pool);   // what this player gets from a pool
+  const doorInfo = seat ? { door: { holder: seat.holder, cap: doorP.cap, nonHolderBps: doorP.nonHolderBps } } : {};
   const jInfo = jw ? { jackpot: { week: jw.from, game: jw.game, raw: result.score, points: sub.score, num: jst.num, den: jst.den } } : {};
   // Bounty cabinet: an unflagged record takes the whole pool. A flagged record
   // is held like any other flagged run — it goes on the board, nothing pays.
@@ -322,27 +381,31 @@ async function chainSubmit(creditId, body, result) {
     const prevRaw = jst ? jackpot.barRaw(jw, jst) : bar;   // the raw score the player sees they beat
     if (isRecord && !chain.bountyInSubmit) {
       const { txSig } = await chain.claimBounty(credit.cabinet, sub);
-      announceBounty(credit.player, result.score, prevRaw, b.pool, wantGame);
-      return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: credit.player, bounty: { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: b.pool } };
+      announceBounty(realPlayer, result.score, prevRaw, b.pool, wantGame);
+      return { ok: true, txSig, replayHash: replayHash.toString("hex"), player: realPlayer, bounty: { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: b.pool } };
     }
     // JACKPOT HOLD: a record over a big pool waits for a human look at the
     // replay before it touches the chain. The contract only takes a score
     // within SUBMIT_WINDOW of the coin, so the hold has a hard deadline and a
     // default action (BOUNTY_HOLD_DEFAULT) if nobody decides in time.
     if (isRecord && chain.bountyInSubmit && b.pool >= HOLD_WEI && credit.insertedAt) {
-      const h = await openHold(credit, sub, result, b, { prevRaw, game: wantGame, weekFrom: jw ? jw.from : null });
-      return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: credit.player, ...jInfo,
-        bounty: { held: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, poolLamports: b.pool } };
+      const h = await openHold(credit, sub, result, b, { prevRaw, game: wantGame, weekFrom: jw ? jw.from : null, player: realPlayer,
+        door: seat ? JACKPOT_DOOR : null, commit: commit.toString("hex"), holder: seat ? seat.holder : null, payout: takeHome(b.pool) });
+      return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: realPlayer, ...jInfo, ...doorInfo,
+        bounty: { held: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, poolLamports: b.pool, payoutLamports: takeHome(b.pool) } };
     }
-    if (isRecord) announceBounty(credit.player, result.score, prevRaw, b.pool, wantGame);
-    bountyNote = isRecord ? { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: b.pool }
+    if (isRecord) announceBounty(realPlayer, result.score, prevRaw, takeHome(b.pool), wantGame);
+    bountyNote = isRecord ? { claimed: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, paidLamports: takeHome(b.pool), jackpotLamports: b.pool }
       : { claimed: false, record: prevRaw, floor: 0, bar: prevRaw, poolLamports: b.pool };
   }
   const { txSig, batched } = await chain.submit(credit.cabinet, sub);
+  let doorSettle = null;
+  if (seat && bountyNote && bountyNote.claimed) doorSettle = await settleDoorWin({ txSig, door: JACKPOT_DOOR, commit: commit.toString("hex") });
   if (jw && bountyNote && bountyNote.claimed) {   // the week's raw record moves only once the chain agrees
     try { const post = await chain.bounty(credit.cabinet); if (post.record === sub.score && sameAddr(post.champion, credit.player)) jackpot.noteWin(jw, result.score); } catch (e) {}
   }
-  return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: credit.player, ...jInfo, ...(bountyNote ? { bounty: bountyNote } : {}) };
+  if (doorSettle && doorSettle.receivedWei && bountyNote) bountyNote.paidLamports = doorPayout(doorP, seat.holder, Number(doorSettle.receivedWei));   // exact, from the receipt
+  return { ok: true, txSig, batched, replayHash: replayHash.toString("hex"), player: realPlayer, ...jInfo, ...doorInfo, ...(bountyNote ? { bounty: bountyNote } : {}) };
 }
 // ---------- jackpot hold ----------
 const HOLD_WEI = Number(process.env.BOUNTY_HOLD_WEI || "100000000000000000");   // 0.1 ETH
@@ -368,11 +431,12 @@ async function openHold(credit, sub, result, b, extra = {}) {
   const h = {
     id: crypto.randomBytes(8).toString("hex"), token: crypto.randomBytes(16).toString("hex"), status: "pending",
     createdAt: Date.now(), deadline: Math.floor(Date.now() / 1000) + secsLeft,   // unix seconds, server clock
-    cab: credit.cabinet, creditId: sub.creditId, player: credit.player, score: result.score,
+    cab: credit.cabinet, creditId: sub.creditId, player: extra.player || credit.player, score: result.score,
+    door: extra.door || null, commit: extra.commit || null, holder: extra.holder, payout: extra.payout,
     prevRecord: extra.prevRaw != null ? extra.prevRaw : b.record, floor: extra.prevRaw != null ? 0 : (b.floor || 0), poolWei: b.pool, ticks: result.ticks,
     game: extra.game || "voidrocks", weekFrom: extra.weekFrom || null,
     tas: { flagged: !!result.tas.flagged, score: result.tas.score, signals: result.tas.signals },
-    playsToday: (walletVolume.get(credit.player) || {}).count || 0,
+    playsToday: (walletVolume.get(extra.player || credit.player) || {}).count || 0,
     sub: { player: sub.player, secret: sub.secret, score: sub.score, replayHash: sub.replayHash.toString("hex"), flagged: !!sub.flagged },
   };
   saveHold(h); scheduleHold(h); notifyHold(h);
@@ -404,8 +468,12 @@ async function decideHold(id, action, by) {
     h.txSig = r.txSig;
     if (!flagged) {
       const post = await chain.bounty(h.cab);
-      const won = post.record === h.sub.score && String(post.champion).toLowerCase() === String(h.player).toLowerCase();   // on-chain score is points
+      const won = post.record === h.sub.score && String(post.champion).toLowerCase() === String(h.sub.player).toLowerCase();   // on-chain: points, and the door when it's a door seat
       h.paidWei = won ? pre.pool : 0;
+      if (won && h.door) {   // the door pays the real winner by status; record what they actually took home
+        const r = await settleDoorWin({ txSig: h.txSig, door: h.door, commit: h.commit });
+        const p = await doorParams(); h.paidWei = doorPayout(p, h.holder, r && r.receivedWei ? Number(r.receivedWei) : pre.pool);
+      }
       if (won && jackpot && h.weekFrom) jackpot.noteWin({ from: h.weekFrom }, h.score);
       if (won) announceBounty(h.player, h.score, h.prevRecord, pre.pool, h.game);
     }
@@ -676,7 +744,8 @@ const server = http.createServer((req, res) => {
     (async () => {
       const j = await jackpot.publicState(Math.floor(Date.now() / 1000)); if (!j) return send(404, { error: "no week scheduled" });
       const b = await chain.bounty(2);
-      send(200, { ...j, title: gameTitle(j.game), poolLamports: b.pool, recordPoints: b.record, unit: chain.unit, schedule: jackpot.schedule().map((w) => ({ from: w.from, game: w.game, target: w.target })) });
+      const view = await bountyView(b);
+      send(200, { ...j, title: gameTitle(j.game), poolLamports: b.pool, recordPoints: b.record, unit: chain.unit, door: view.door || null, schedule: jackpot.schedule().map((w) => ({ from: w.from, game: w.game, target: w.target })) });
     })().catch((e) => send(502, { error: String(e).slice(0, 200) }));
     return;
   }
@@ -694,7 +763,7 @@ const server = http.createServer((req, res) => {
         let info = null; try { info = await cabinetInfo(cab); } catch (e) {}
         if (!info) return;
         let pot = null; try { pot = await chain.pot(cab, day); } catch (e) { /* no pot yet */ }
-        const entries = pot ? pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: shownScore(cab, e), flagged: e.flagged })).sort((a, b) => b.score - a.score) : [];
+        const entries = pot ? pot.entries.map((e) => { const pl = shownPlayer(cab, e); return { player: pl, name: nameOf(pl), score: shownScore(cab, e), flagged: e.flagged }; }).sort((a, b) => b.score - a.score) : [];
         const ha = houseAdds[chain.potId(cab, day)];
         const board = { cabinetId: cab, game: info.game, priceLamports: info.price || cfg.quarter || 0, potLamports: pot ? pot.balance : 0, poolLamports: pot ? pot.pool : 0,
           houseAdd: ha ? ha.lamports : 0, count: entries.length, top: entries.slice(0, 10) };
@@ -722,7 +791,7 @@ const server = http.createServer((req, res) => {
       try {
         const pot = await chain.pot(cabId, day);
         if (pot) {
-          entries = pot.entries.map((e) => ({ player: e.player, name: nameOf(e.player), score: shownScore(cabId, e), replayHash: e.replayHash, flagged: e.flagged }));
+          entries = pot.entries.map((e) => { const pl = shownPlayer(cabId, e); return { player: pl, name: nameOf(pl), score: shownScore(cabId, e), replayHash: e.replayHash, flagged: e.flagged }; });
           potLamports = pot.balance; poolLamports = pot.pool;
           const ha = houseAdds[chain.potId(cabId, day)]; houseAdd = ha ? ha.lamports : 0;
         }
@@ -756,7 +825,7 @@ const server = http.createServer((req, res) => {
       for (const entry of pots) {
         if (!entry) continue;
         const [cab, pot] = entry;
-        const sorted = pot.entries.map((e) => ({ player: e.player, score: shownScore(cab, e) })).sort((a, b) => b.score - a.score);
+        const sorted = pot.entries.map((e) => ({ player: shownPlayer(cab, e), score: shownScore(cab, e) })).sort((a, b) => b.score - a.score);
         sorted.forEach((e, rank) => { if (sameAddr(e.player, pubkey)) standings.push({ cabinetId: cab, rank: rank + 1, score: e.score, of: sorted.length }); });
       }
       // Receipts: newest 200 files, matched by player.
@@ -821,6 +890,12 @@ const server = http.createServer((req, res) => {
         sensors.sweepFreshness = { status: up < 2 * every ? "green" : age < 2 * every ? "green" : age < 6 * every ? "yellow" : "red", detail: `last ok ${Math.round(age / 1000)}s ago` };
         sensors.sweepErrors = { status: settle.lastSweepErrors > 0 ? "yellow" : "green", detail: settle.lastSweepErrors > 0 ? (settle.lastError || settle.lastOpenError || "") : "clean" };
         sensors.stalePots = { status: settle.pending > 3 ? "red" : settle.pending > 0 ? "yellow" : "green", detail: `${settle.pending} unsettled past grace` };
+      }
+        if (JACKPOT_DOOR) {   // a door win that hasn't reached its winner is money owed right now
+          const stuck = doorSettles.filter((j) => Date.now() - (j.since || Date.now()) > 10 * 60000);
+          sensors.doorSettles = { status: stuck.length ? "red" : doorSettles.length ? "yellow" : "green",
+            detail: doorSettles.length ? `${doorSettles.length} door win(s) waiting to settle: ${doorSettles.map((j) => j.lastError || "").join("; ").slice(0, 120)}` : "every door win settled" };
+        }
         if (jackpot) {
           try {
             const nowS = Math.floor(Date.now() / 1000), j = jackpotPublic;   // refreshed every minute below
@@ -833,7 +908,6 @@ const server = http.createServer((req, res) => {
             }
           } catch (e) { sensors.jackpot = { status: "yellow", detail: "rotation state unreadable: " + String(e.message || e).slice(0, 80) }; }
         }
-      }
     }
     const rank = { green: 0, yellow: 1, red: 2 };
     const overall = Object.values(sensors).reduce((w, x) => (rank[x.status] > rank[w] ? x.status : w), "green");
