@@ -203,6 +203,26 @@ async function bountyView(b) {
   }
   return v;
 }
+// Claude's first-pass review of held Bounty wins (verifier/reviewer.js). Off unless ANTHROPIC_API_KEY is set.
+const reviewer = require("./reviewer.js");
+const REVIEW_AUTO_MIN = parseFloat(process.env.REVIEW_AUTO_MIN || "0.85");   // "human" at or above this confidence pays without waking anyone
+const REVIEW_NOTIFY_AFTER_MS = 150000;   // if the review hasn't answered by then, alert the owner anyway
+// who is this wallet: plays today, earlier verified runs on record, on-chain activity
+async function walletFacts(player) {
+  const f = { playsToday: (walletVolume.get(player) || {}).count || 0, earlierRuns: 0, bestByGame: {}, firstSeen: null };
+  try {
+    const files = fs.readdirSync(RECEIPTS_DIR).filter((n) => n.endsWith(".json"));
+    for (const n of files.slice(-3000)) {
+      let rc; try { rc = JSON.parse(fs.readFileSync(path.join(RECEIPTS_DIR, n), "utf8")); } catch (e) { continue; }
+      const pl = rc.onchain && rc.onchain.player; if (!pl || !sameAddr(pl, player) || !rc.verdict) continue;
+      f.earlierRuns++; f.bestByGame[rc.game] = Math.max(f.bestByGame[rc.game] || 0, rc.verdict.score);
+      if (!f.firstSeen || rc.verdict.verifiedAt < f.firstSeen) f.firstSeen = rc.verdict.verifiedAt;
+    }
+    if (f.firstSeen) f.firstSeen = new Date(f.firstSeen).toISOString();
+  } catch (e) {}
+  try { if (chain.walletFacts) Object.assign(f, await chain.walletFacts(player)); } catch (e) {}
+  return f;
+}
 const cabinetCache = new Map();   // cab → { game, operator, isBounty }
 async function cabinetInfo(cab) { if (cabinetCache.has(cab)) return cabinetCache.get(cab); const c = await chain.cabinet(cab); if (c) cabinetCache.set(cab, c); return c; }
 const sameAddr = (a, b) => String(a).toLowerCase() === String(b).toLowerCase();
@@ -390,7 +410,12 @@ async function chainSubmit(creditId, body, result) {
     // within SUBMIT_WINDOW of the coin, so the hold has a hard deadline and a
     // default action (BOUNTY_HOLD_DEFAULT) if nobody decides in time.
     if (isRecord && chain.bountyInSubmit && b.pool >= HOLD_WEI && credit.insertedAt) {
-      const h = await openHold(credit, sub, result, b, { prevRaw, game: wantGame, weekFrom: jw ? jw.from : null, player: realPlayer,
+      let evidence = null;
+      if (reviewer.enabled()) {
+        try { evidence = reviewer.buildEvidence({ Engine: GAMES[body.game], game: body.game, seed: body.seed, masks: result.masks || [], score: result.score, target: prevRaw, tas: result.tas, wallet: await walletFacts(realPlayer) }); }
+        catch (e) { console.log("review: evidence failed " + e.message); }
+      }
+      const h = await openHold(credit, sub, result, b, { evidence, prevRaw, game: wantGame, weekFrom: jw ? jw.from : null, player: realPlayer,
         door: seat ? JACKPOT_DOOR : null, commit: commit.toString("hex"), holder: seat ? seat.holder : null, payout: takeHome(b.pool) });
       return { ok: true, held: true, holdId: h.id, deadline: h.deadline, replayHash: replayHash.toString("hex"), player: realPlayer, ...jInfo, ...doorInfo,
         bounty: { held: true, previousRecord: prevRaw, floor: 0, newRecord: result.score, poolLamports: b.pool, payoutLamports: takeHome(b.pool) } };
@@ -421,7 +446,8 @@ const holds = new Map(), holdTimers = new Map();
 function saveHold(h) { holds.set(h.id, h); fs.writeFileSync(path.join(HOLDS_DIR, h.id + ".json"), JSON.stringify(h, null, 1)); }
 function holdPublic(h) {
   return { id: h.id, status: h.status, score: h.score, deadline: h.deadline, previousRecord: h.prevRecord, floor: h.floor,
-    poolWei: h.poolWei, paidWei: h.paidWei || 0, txSig: h.txSig || null, decidedBy: h.decidedBy || null };
+    poolWei: h.poolWei, paidWei: h.paidWei || 0, txSig: h.txSig || null, decidedBy: h.decidedBy || null,
+    review: h.ai ? { verdict: h.ai.verdict, confidence: h.ai.confidence, reasons: h.ai.reasons, model: h.ai.model } : null };
 }
 async function openHold(credit, sub, result, b, extra = {}) {
   // The window is measured in CHAIN time; the timer runs on this server's
@@ -434,28 +460,49 @@ async function openHold(credit, sub, result, b, extra = {}) {
     createdAt: Date.now(), deadline: Math.floor(Date.now() / 1000) + secsLeft,   // unix seconds, server clock
     cab: credit.cabinet, creditId: sub.creditId, player: extra.player || credit.player, score: result.score,
     door: extra.door || null, commit: extra.commit || null, holder: extra.holder, payout: extra.payout,
+    evidence: extra.evidence || null, ai: null, defaultAction: null, notified: false,
     prevRecord: extra.prevRaw != null ? extra.prevRaw : b.record, floor: extra.prevRaw != null ? 0 : (b.floor || 0), poolWei: b.pool, ticks: result.ticks,
     game: extra.game || "voidrocks", weekFrom: extra.weekFrom || null,
     tas: { flagged: !!result.tas.flagged, score: result.tas.score, signals: result.tas.signals },
     playsToday: (walletVolume.get(extra.player || credit.player) || {}).count || 0,
     sub: { player: sub.player, secret: sub.secret, score: sub.score, replayHash: sub.replayHash.toString("hex"), flagged: !!sub.flagged },
   };
-  saveHold(h); scheduleHold(h); notifyHold(h);
+  saveHold(h); scheduleHold(h);
+  if (h.evidence && reviewer.enabled()) {   // Claude first; the owner hears about it only if needed (or if the review is slow)
+    setTimeout(() => { const x = holds.get(h.id); if (x && x.status === "pending" && !x.notified) notifyHold(x); }, REVIEW_NOTIFY_AFTER_MS);
+    runReview(h.id).catch((e) => { console.log(`hold ${h.id}: review crashed ${e.message}`); const x = holds.get(h.id); if (x && !x.notified) notifyHold(x); });
+  } else notifyHold(h);
   console.log(`hold ${h.id}: bounty record ${h.score} by ${h.player} over ${h.poolWei} wei, decide by ${new Date(h.deadline * 1000).toISOString()} (default ${HOLD_DEFAULT})`);
   return h;
 }
 function scheduleHold(h) {
   clearTimeout(holdTimers.get(h.id));
   const ms = Math.max(0, h.deadline * 1000 - Date.now());
-  holdTimers.set(h.id, setTimeout(() => decideHold(h.id, HOLD_DEFAULT, "timeout").catch((e) => console.log("hold timeout error " + e.message)), ms));
+  // if nobody decides, the review's recommendation stands (bot → reject); without one, HOLD_DEFAULT
+  holdTimers.set(h.id, setTimeout(() => { const x = holds.get(h.id) || h; decideHold(h.id, x.defaultAction || HOLD_DEFAULT, x.defaultAction ? "timeout (review's call)" : "timeout").catch((e) => console.log("hold timeout error " + e.message)); }, ms));
+}
+async function runReview(id) {
+  const h0 = holds.get(id); if (!h0 || !h0.evidence) return;
+  const v = await reviewer.review(h0.evidence);
+  const h = holds.get(id); if (!h || h.status !== "pending") return;
+  h.ai = v;
+  if (v) {
+    console.log(`hold ${id}: review says ${v.verdict} (${Math.round(v.confidence * 100)}%)`);
+    if (v.verdict === "human" && v.confidence >= REVIEW_AUTO_MIN && !(h.tas && h.tas.flagged)) { saveHold(h); await decideHold(id, "pay", "review (human, " + Math.round(v.confidence * 100) + "%)"); return; }
+    if (v.verdict === "bot") h.defaultAction = "flag";
+  }
+  saveHold(h); scheduleHold(h);
+  if (!h.notified) notifyHold(h);
 }
 function notifyHold(h) {
+  h.notified = true; try { saveHold(h); } catch (e) {}
   const topic = process.env.NTFY_TOPIC; if (!topic) { console.log(`hold ${h.id}: NTFY_TOPIC unset, no push`); return; }
   const mins = Math.max(0, Math.round((h.deadline * 1000 - Date.now()) / 60000));
   fetch("https://ntfy.sh/" + encodeURIComponent(topic), { method: "POST",
     headers: { Title: "JACKPOT REVIEW: " + h.score + " for " + chain.fmt(h.poolWei) + " ETH", Priority: "urgent", Tags: "rotating_light",
       Click: PUBLIC_URL + "/review/" + h.id + "?t=" + h.token },
-    body: "Beat " + Math.max(h.prevRecord, h.floor) + ". " + mins + " min to decide, then default: " + HOLD_DEFAULT.toUpperCase() + ". Tap to review." })
+    body: (h.ai ? "Claude: " + h.ai.verdict.toUpperCase() + " (" + Math.round(h.ai.confidence * 100) + "%). " + (h.ai.reasons[0] || "") + " " : h.evidence && reviewer.enabled() ? "Claude's review is still running. " : "") +
+      "Beat " + Math.max(h.prevRecord, h.floor) + ". " + mins + " min to decide, then: " + (h.defaultAction || HOLD_DEFAULT).toUpperCase() + ". Tap to review." })
     .catch((e) => console.log(`hold ${h.id}: push failed ${e.message}`));
 }
 async function decideHold(id, action, by) {
@@ -490,7 +537,7 @@ async function decideHold(id, action, by) {
 function restoreHolds() {
   for (const f of fs.readdirSync(HOLDS_DIR).filter((n) => n.endsWith(".json"))) {
     try { const h = JSON.parse(fs.readFileSync(path.join(HOLDS_DIR, f), "utf8")); holds.set(h.id, h);
-      if (h.status === "pending") scheduleHold(h);
+      if (h.status === "pending") { scheduleHold(h); if (!h.notified) notifyHold(h); }   // a restart must not swallow an alert
       if (h.status === "submitting") console.log(`hold ${h.id}: was mid-submit at restart — check tx and credit ${h.creditId} by hand`);
     } catch (e) { console.log("hold restore: bad file " + f); }
   }
@@ -517,6 +564,9 @@ ${open ? `<div class="st"><div class="k">TIME TO DECIDE, THEN AUTO-${esc(HOLD_DE
 <div class="row"><span>run length</span><b>${esc(Math.round(h.ticks / 60))}s</b></div>
 <div class="row"><span>bot-timing check</span><b class="${h.tas.flagged ? "flag" : ""}">${h.tas.flagged ? "FLAGGED" : "passed"} · score ${esc(h.tas.score)}</b></div>
 ${(h.tas.signals || []).length ? `<div class="row"><span>signals</span><b>${esc((h.tas.signals || []).join(", "))}</b></div>` : ""}
+${h.ai ? `<div class="st"><div class="k">CLAUDE'S REVIEW · ${esc(h.ai.model || "")}</div><div class="clock" style="color:${h.ai.verdict === "human" ? "#3DD8A8" : h.ai.verdict === "bot" ? "#E8402F" : "#E3B54A"}">${esc(h.ai.verdict.toUpperCase())} · ${Math.round(h.ai.confidence * 100)}%</div><ul style="margin:8px 0 0;padding-left:18px;font-size:13px;line-height:1.5">${h.ai.reasons.map((r) => "<li>" + esc(r) + "</li>").join("")}</ul>${h.defaultAction ? `<div class="k" style="margin-top:8px">IF NOBODY DECIDES: ${esc(h.defaultAction === "flag" ? "REJECT" : "PAY")}</div>` : ""}</div>`
+  : h.evidence && reviewer.enabled() && open ? `<div class="st"><div class="k">CLAUDE'S REVIEW</div>still running, refresh in a minute</div>` : ""}
+${h.evidence && h.evidence.reactions && h.evidence.reactions.threats ? `<div class="row"><span>reaction to threats</span><b>median ${esc(h.evidence.reactions.median)} ticks · ${esc(Math.round(h.evidence.reactions.under6ticksShare * 100))}% under 100 ms · n=${esc(h.evidence.reactions.threats)}</b></div>` : ""}
 <a class="w8" href="${esc(watch(8))}" target="_blank" rel="noopener">WATCH REPLAY · 8×</a>
 <a class="w8" href="${esc(watch(16))}" target="_blank" rel="noopener">WATCH REPLAY · 16×</a>
 ${open ? `<form method="post" action="/review/${esc(h.id)}/approve?t=${esc(t)}"><button class="pay">APPROVE · PAY THE POOL</button></form>
@@ -695,6 +745,22 @@ const server = http.createServer((req, res) => {
     return;
   }
   // Buyback receipts (public): every sponsored-cabinet buyback with its transactions.
+  if (req.method === "POST" && /^\/review-selftest\/[A-Za-z0-9_-]{1,66}$/.test(req.url)) {
+    const at = Buffer.from(String(req.headers["x-admin-token"] || "")), want = Buffer.from(String(process.env.ADMIN_TOKEN || ""));
+    if (!want.length || at.length !== want.length || !crypto.timingSafeEqual(at, want)) return send(401, { error: "admin token" });
+    (async () => {
+      const id = req.url.split("/")[2], rp = path.join(RECEIPTS_DIR, id + ".json");
+      if (!fs.existsSync(rp)) return send(404, { error: "no such receipt" });
+      const rc = JSON.parse(fs.readFileSync(rp, "utf8")), Engine = GAMES[rc.game];
+      if (!Engine) return send(422, { error: "unknown game" });
+      const player = (rc.onchain && rc.onchain.player) || "0x0000000000000000000000000000000000000000";
+      const evidence = reviewer.buildEvidence({ Engine, game: rc.game, seed: rc.seed, masks: Engine.decodeRLE(rc.inputsRLE), score: rc.verdict.score, target: null,
+        tas: { flagged: rc.verdict.tasFlagged, signals: (rc.verdict.analysis || {}).signals || [], features: (rc.verdict.analysis || {}).features || {} }, wallet: await walletFacts(player) });
+      const t0 = Date.now(), verdict = await reviewer.review(evidence);
+      send(200, { enabled: reviewer.enabled(), model: reviewer.MODEL, ms: Date.now() - t0, verdict, evidence });
+    })().catch((e) => send(500, { error: String(e.message || e).slice(0, 200) }));
+    return;
+  }
   if (req.method === "GET" && req.url === "/buybacks") return send(200, { buybacks: buybacks.slice(-100).reverse() });
   // Launch config the site reads at runtime (one source of truth: Fly env).
   if (req.method === "GET" && req.url === "/config") {
@@ -940,7 +1006,7 @@ const server = http.createServer((req, res) => {
 
   if (req.method === "GET" && req.url.startsWith("/replays/")) {
     const name = req.url.slice("/replays/".length);
-    if (!/^[A-Za-z0-9_-]{1,64}\.json$/.test(name)) return send(400, { error: "bad name" });
+    if (!/^[A-Za-z0-9_-]{1,66}\.json$/.test(name)) return send(400, { error: "bad name" });   // EVM credit ids are 0x + 64 hex = 66
     const p = path.join(RECEIPTS_DIR, name);
     if (!fs.existsSync(p)) return send(404, { error: "no such receipt" });
     res.writeHead(200, { "content-type": "application/json", "access-control-allow-origin": "*" });

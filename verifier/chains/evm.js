@@ -77,6 +77,12 @@ function makeEvmChain({ rpcUrl, chainId, contract, privateKey, network, log = co
     },
     // floor: the contract's minimum winning score (contracts before bountyFloor have none).
     // bar = what a run must BEAT to pay — the same max() the contract applies in _submit.
+    // on-chain activity for the reviewer: how many transactions this wallet has ever sent, and its balance
+    async walletFacts(addr) {
+      const a = getAddress(addr);
+      const [nonce, bal] = await Promise.all([pub.getTransactionCount({ address: a }), pub.getBalance({ address: a })]);
+      return { onchainTxCount: nonce, balanceEth: Number(formatEther(bal)).toFixed(4) };
+    },
     // --- THE BOUNTY's door (evm/src/JackpotDoor.sol) ---
     async doorSeat(door, commitHex) {
       const r = await pub.readContract({ address: getAddress(door), abi: doorAbi(), functionName: "seats", args: ["0x" + commitHex.replace(/^0x/, "")] });

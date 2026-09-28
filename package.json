@@ -10,6 +10,7 @@
     "verifier": "node verifier/service.js"
   },
   "dependencies": {
-    "viem": "^2.56.3"
+    "viem": "^2.56.3",
+    "@anthropic-ai/sdk": "^0.129.0"
   }
 }
